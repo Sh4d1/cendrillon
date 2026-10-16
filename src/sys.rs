@@ -146,6 +146,19 @@ pub fn tree_size(path: &Path) -> u64 {
         .sum()
 }
 
+/// Bytes that deleting `path` is sure to free: a file also linked from elsewhere is not
+/// counted.
+pub fn unshared_size(path: &Path) -> u64 {
+    WalkDir::new(path)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_dir() || meta.nlink() == 1)
+        .map(|meta| meta.blocks() * 512)
+        .sum()
+}
+
 /// Deletes `path` and everything under it, first making read-only directories writable, as
 /// Bazel leaves many of them. Symlinks are removed, never followed. Returns the bytes
 /// allocated by the tree.

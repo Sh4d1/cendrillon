@@ -1,10 +1,11 @@
 //! The cleaning policy: what to delete, given what is on disk and how much space is needed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::cargo::Target;
 use crate::config::Config;
 use crate::inventory::{AGE_BUCKET, Cache, InstallBase, Inventory, OutputBase, Usage, Workspace};
 
@@ -43,6 +44,13 @@ pub enum Action {
     EvictEntries {
         cache: Cache,
         older_than: SystemTime,
+        reason: Reason,
+    },
+    /// Delete the build units of a Cargo target that nothing current depends on.
+    TrimTarget(Target),
+    /// Skipped if Cargo used the target again after `target.last_used`.
+    DeleteTarget {
+        target: Target,
         reason: Reason,
     },
 }
@@ -111,6 +119,11 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
 
     let expiry = before(now, config.cache_entry_idle);
     let mut cutoffs: HashMap<&Path, SystemTime> = HashMap::new();
+    let (idle_targets, live_targets): (Vec<&Target>, Vec<&Target>) = inventory
+        .targets
+        .iter()
+        .partition(|target| idle_since(target.last_used) >= config.target_idle);
+    let mut evicted_targets: HashSet<&Path> = HashSet::new();
     if let Some(pressure) = pressure {
         let usage = &pressure.usage;
         let floor = before(now, config.recent_use_floor);
@@ -121,6 +134,14 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
                 _ => 0,
             })
             .sum();
+        freed += idle_targets
+            .iter()
+            .map(|target| usage.size(&target.root))
+            .sum::<u64>();
+        freed += live_targets
+            .iter()
+            .map(|target| usage.garbage(&target.root))
+            .sum::<u64>();
 
         // Every candidate, keyed by the time it was last used.
         let mut queue: Vec<(SystemTime, Candidate)> = kept
@@ -128,6 +149,12 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
             .filter(|base| base.last_used < floor && usage.sizes.contains_key(&base.path))
             .map(|base| (base.last_used, Candidate::OutputBase(base)))
             .collect();
+        queue.extend(
+            live_targets
+                .iter()
+                .filter(|target| target.last_used < floor && usage.sizes.contains_key(&target.root))
+                .map(|target| (target.last_used, Candidate::Target(target))),
+        );
         for cache in &inventory.caches {
             let Some(ages) = usage.ages.get(&cache.root) else {
                 continue;
@@ -166,6 +193,13 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
                     freed += bytes;
                     cutoffs.insert(root, end);
                 }
+                Candidate::Target(target) => {
+                    // What the trim would not have freed already.
+                    freed += usage
+                        .size(&target.root)
+                        .saturating_sub(usage.garbage(&target.root));
+                    evicted_targets.insert(&target.root);
+                }
             }
         }
     }
@@ -185,6 +219,23 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
         };
         actions.push(action);
     }
+
+    for target in idle_targets {
+        actions.push(Action::DeleteTarget {
+            target: target.clone(),
+            reason: Reason::Idle(idle_since(target.last_used)),
+        });
+    }
+    for target in live_targets {
+        actions.push(if evicted_targets.contains(target.root.as_path()) {
+            Action::DeleteTarget {
+                target: target.clone(),
+                reason: Reason::DiskPressure,
+            }
+        } else {
+            Action::TrimTarget(target.clone())
+        });
+    }
     actions
 }
 
@@ -194,6 +245,7 @@ fn before(now: SystemTime, duration: Duration) -> SystemTime {
 
 enum Candidate<'a> {
     OutputBase(&'a OutputBase),
+    Target(&'a Target),
     /// The disk-cache entries in the age bucket that ends at `end`.
     Entries {
         root: &'a Path,
@@ -253,6 +305,83 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    fn target(name: &str, idle: Duration) -> Target {
+        Target {
+            root: PathBuf::from(format!("/src/{name}/target")),
+            last_used: now() - idle,
+        }
+    }
+
+    fn target_actions(actions: &[Action]) -> Vec<(&str, Option<&Reason>)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::TrimTarget(target) => Some((target.root.to_str()?, None)),
+                Action::DeleteTarget { target, reason } => {
+                    Some((target.root.to_str()?, Some(reason)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn targets_are_trimmed_on_full_sweeps_and_deleted_once_idle() {
+        let inventory = Inventory {
+            targets: vec![target("active", HOUR), target("abandoned", 8 * 24 * HOUR)],
+            ..Inventory::default()
+        };
+        let config = Config::default();
+        assert!(target_actions(&plan(&inventory, now(), &config, Sweep::Orphans)).is_empty());
+
+        let actions = plan(&inventory, now(), &config, Sweep::Full { pressure: None });
+        assert_eq!(
+            target_actions(&actions),
+            [
+                ("/src/abandoned/target", Some(&Reason::Idle(8 * 24 * HOUR))),
+                ("/src/active/target", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn pressure_counts_trimmed_garbage_before_deleting_whole_targets() {
+        let inventory = Inventory {
+            targets: vec![target("older", 10 * HOUR), target("newer", 5 * HOUR)],
+            ..Inventory::default()
+        };
+        let usage = Usage {
+            sizes: HashMap::from([
+                ("/src/older/target".into(), 1000),
+                ("/src/newer/target".into(), 1000),
+            ]),
+            garbage: HashMap::from([("/src/older/target".into(), 900)]),
+            ..Usage::default()
+        };
+        let sweep = |bytes_to_free| Sweep::Full {
+            pressure: Some(Pressure {
+                bytes_to_free,
+                usage: usage.clone(),
+            }),
+        };
+        let config = Config::default();
+
+        let actions = plan(&inventory, now(), &config, sweep(800));
+        assert_eq!(
+            target_actions(&actions),
+            [("/src/older/target", None), ("/src/newer/target", None)]
+        );
+
+        let actions = plan(&inventory, now(), &config, sweep(1000));
+        assert_eq!(
+            target_actions(&actions),
+            [
+                ("/src/older/target", Some(&Reason::DiskPressure)),
+                ("/src/newer/target", None),
+            ]
+        );
     }
 
     #[test]
@@ -344,6 +473,7 @@ mod tests {
                     (now() - 3 * HOUR, 400),
                 ]),
             )]),
+            ..Usage::default()
         };
         let pressure = Pressure {
             // orphan + expired entries (150) + 20h and 10h-old items (1400) fall short by 50;
@@ -408,6 +538,7 @@ mod tests {
         let usage = Usage {
             sizes: HashMap::from([("/root/one_hour".into(), 1000)]),
             ages: HashMap::from([(cache.root.clone(), BTreeMap::from([(now() - HOUR, 1000)]))]),
+            ..Usage::default()
         };
         let actions = plan(
             &inventory,

@@ -1,4 +1,4 @@
-//! What Bazel keeps on disk: classifying directories and measuring them.
+//! What Bazel and Cargo keep on disk: classifying directories and measuring them.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, FileType};
@@ -7,6 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::cargo::{self, Target};
 use crate::sys;
 
 /// Name prefix of a directory renamed for deletion, finished on a later pass if interrupted.
@@ -17,6 +18,7 @@ pub enum Item {
     OutputBase(OutputBase),
     InstallBase(InstallBase),
     Cache(Cache),
+    CargoTarget(Target),
     Trash(PathBuf),
 }
 
@@ -26,6 +28,7 @@ impl Item {
             Item::OutputBase(base) => &base.path,
             Item::InstallBase(base) => &base.path,
             Item::Cache(cache) => &cache.root,
+            Item::CargoTarget(target) => &target.root,
             Item::Trash(path) => path,
         }
     }
@@ -73,8 +76,8 @@ pub enum CacheKind {
     Repository,
 }
 
-/// Recognizes a Bazel-managed directory from the markers Bazel leaves in it. The checks are
-/// strict, because whatever matches under the home directory may be deleted.
+/// Recognizes a directory Bazel or Cargo manages from the markers they leave in it. The checks
+/// are strict, because whatever matches under the home directory may be deleted.
 pub fn classify(dir: &Path) -> Option<Item> {
     let name = dir.file_name()?.to_str()?;
     if name.starts_with(TRASH_PREFIX) {
@@ -93,6 +96,9 @@ pub fn classify(dir: &Path) -> Option<Item> {
             path: dir.to_path_buf(),
             last_used: mtime(dir).ok()?,
         }));
+    }
+    if let Some(target) = Target::classify(dir) {
+        return Some(Item::CargoTarget(target));
     }
     let is_shard = |name: &str, kind: FileType| kind.is_dir() && is_hex(name, 2);
     let kind = if ["ac", "cas"]
@@ -201,6 +207,7 @@ pub struct Inventory {
     pub output_bases: Vec<OutputBase>,
     pub install_bases: Vec<InstallBase>,
     pub caches: Vec<Cache>,
+    pub targets: Vec<Target>,
     pub trash: Vec<PathBuf>,
 }
 
@@ -216,6 +223,7 @@ impl FromIterator<Item> for Inventory {
                 Item::OutputBase(base) => inventory.output_bases.push(base),
                 Item::InstallBase(base) => inventory.install_bases.push(base),
                 Item::Cache(cache) => inventory.caches.push(cache),
+                Item::CargoTarget(target) => inventory.targets.push(target),
                 Item::Trash(path) => inventory.trash.push(path),
             }
         }
@@ -228,8 +236,13 @@ impl Inventory {
         let bases = self.output_bases.iter().cloned().map(Item::OutputBase);
         let installs = self.install_bases.iter().cloned().map(Item::InstallBase);
         let caches = self.caches.iter().cloned().map(Item::Cache);
+        let targets = self.targets.iter().cloned().map(Item::CargoTarget);
         let trash = self.trash.iter().cloned().map(Item::Trash);
-        bases.chain(installs).chain(caches).chain(trash)
+        bases
+            .chain(installs)
+            .chain(caches)
+            .chain(targets)
+            .chain(trash)
     }
 }
 
@@ -242,11 +255,15 @@ pub struct Usage {
     pub sizes: HashMap<PathBuf, u64>,
     /// Per disk cache: bytes per [`AGE_BUCKET`], keyed by the bucket's start.
     pub ages: HashMap<PathBuf, BTreeMap<SystemTime, u64>>,
+    /// Per Cargo target: bytes of build units nothing current depends on, which trimming
+    /// frees. Included in `sizes`.
+    pub garbage: HashMap<PathBuf, u64>,
 }
 
 impl Usage {
-    /// Walks the given items. Slow on large caches: run it only when sizes matter.
-    pub fn measure(items: impl IntoIterator<Item = Item>) -> Self {
+    /// Walks the given items. Slow on large caches: run it only when sizes matter. Cargo units
+    /// compiled at or after `cargo_live_since` count as current.
+    pub fn measure(items: impl IntoIterator<Item = Item>, cargo_live_since: SystemTime) -> Self {
         let mut usage = Usage::default();
         for item in items {
             let path = item.path().to_path_buf();
@@ -257,6 +274,13 @@ impl Usage {
                     usage.ages.insert(path.clone(), ages);
                     size
                 }
+                Item::CargoTarget(target) => {
+                    if let Ok(garbage) = cargo::garbage(&target.root, cargo_live_since) {
+                        let bytes = garbage.paths.iter().map(|path| sys::unshared_size(path));
+                        usage.garbage.insert(path.clone(), bytes.sum());
+                    }
+                    sys::tree_size(&path)
+                }
                 _ => sys::tree_size(&path),
             };
             usage.sizes.insert(path, size);
@@ -266,6 +290,10 @@ impl Usage {
 
     pub fn size(&self, path: &Path) -> u64 {
         self.sizes.get(path).copied().unwrap_or(0)
+    }
+
+    pub fn garbage(&self, path: &Path) -> u64 {
+        self.garbage.get(path).copied().unwrap_or(0)
     }
 }
 
@@ -531,7 +559,7 @@ mod tests {
             ],
         );
         let inventory: Inventory = classify(&cache).into_iter().collect();
-        let usage = Usage::measure(inventory.items());
+        let usage = Usage::measure(inventory.items(), SystemTime::now());
         let ages = &usage.ages[&cache];
         assert_eq!(ages.len(), 2);
         assert_eq!(ages[&bucket_start(old)], 2 * ages[&bucket_start(now)]);

@@ -133,12 +133,13 @@ pub fn scan_home(env: &Env) -> BTreeSet<PathBuf> {
 }
 
 /// The directory to search to find `item` again, along with its siblings: the output user
-/// root for output bases and install bases, the cache itself for caches.
+/// root for output bases and install bases, the directory itself for caches and targets.
 fn search_root(item: &Item) -> Option<PathBuf> {
     match item {
         Item::OutputBase(_) | Item::Trash(_) => item.path().parent().map(Path::to_path_buf),
         Item::InstallBase(_) => item.path().parent()?.parent().map(Path::to_path_buf),
         Item::Cache(cache) => Some(cache.root.clone()),
+        Item::CargoTarget(target) => Some(target.root.clone()),
     }
 }
 

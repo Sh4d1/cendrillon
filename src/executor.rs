@@ -1,4 +1,4 @@
-//! Carrying out a plan without racing Bazel.
+//! Carrying out a plan without racing Bazel or Cargo.
 
 use std::collections::HashSet;
 use std::fs;
@@ -9,12 +9,13 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
+use crate::cargo::{self, Target};
 use crate::inventory::{
     self, Cache, CacheKind, InstallBase, OutputBase, TRASH_PREFIX, disk_cache_entries,
     repository_cache_entries,
 };
 use crate::planner::Action;
-use crate::sys;
+use crate::sys::{self, FileLock};
 
 /// How long a Bazel server gets to exit after SIGTERM, and again after SIGKILL.
 const SERVER_GRACE: Duration = Duration::from_secs(10);
@@ -23,6 +24,8 @@ pub struct Executor<'a> {
     pub dry_run: bool,
     /// Set by a signal handler; checked between deletions.
     pub stop: &'a AtomicBool,
+    /// Cargo units compiled this recently are never trimmed.
+    pub superseded_grace: Duration,
 }
 
 enum Outcome {
@@ -40,7 +43,8 @@ impl Executor<'_> {
             }
             let (what, reason) = describe(action);
             match self.apply(action) {
-                Ok(Outcome::Freed(0)) if matches!(action, Action::EvictEntries { .. }) => {}
+                Ok(Outcome::Freed(0))
+                    if matches!(action, Action::EvictEntries { .. } | Action::TrimTarget(_)) => {}
                 Ok(Outcome::Freed(bytes)) => {
                     freed += bytes;
                     let verb = if self.dry_run { "would free" } else { "freed" };
@@ -68,6 +72,8 @@ impl Executor<'_> {
                 CacheKind::Disk => self.evict_disk_cache(cache, *older_than),
                 CacheKind::Repository => self.evict_repository_cache(cache, *older_than),
             },
+            Action::TrimTarget(target) => self.trim_target(target),
+            Action::DeleteTarget { target, .. } => self.delete_target(target),
         }
     }
 
@@ -166,6 +172,73 @@ impl Executor<'_> {
         Ok(Outcome::Freed(freed))
     }
 
+    /// Deletes the build units nothing current depends on. The graph is read under Cargo's
+    /// locks: a build in between could otherwise start depending on a unit again without
+    /// changing anything cendrillon checks. Renaming the garbage aside takes seconds, so
+    /// builds wait at most that long; the slow deletion runs after the locks are released.
+    fn trim_target(&self, target: &Target) -> Result<Outcome> {
+        let mut freed = 0;
+        for leftover in trash_in(&target.root) {
+            freed += self.remove(&leftover)?;
+        }
+        let live_since = SystemTime::now()
+            .checked_sub(self.superseded_grace)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if self.dry_run {
+            let garbage = cargo::garbage(&target.root, live_since)?;
+            let bytes: u64 = garbage
+                .paths
+                .iter()
+                .map(|path| sys::unshared_size(path))
+                .sum();
+            return Ok(Outcome::Freed(freed + bytes));
+        }
+        let Some(locks) = lock_profiles(&target.root)? else {
+            return Ok(Outcome::Skipped("a Cargo build is running"));
+        };
+        let garbage = cargo::garbage(&target.root, live_since)?;
+        if garbage.paths.is_empty() {
+            return Ok(Outcome::Freed(freed));
+        }
+        let trash = target.root.join(format!("{TRASH_PREFIX}{}", stamp()));
+        fs::create_dir(&trash).with_context(|| format!("creating {}", trash.display()))?;
+        for (index, path) in garbage.paths.iter().enumerate() {
+            match fs::rename(path, trash.join(index.to_string())) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("renaming {}", path.display()));
+                }
+            }
+        }
+        drop(locks);
+        tracing::info!(
+            "trimming {}: {} superseded units, {} incremental directories",
+            target.root.display(),
+            garbage.units,
+            garbage.incremental_dirs
+        );
+        Ok(Outcome::Freed(freed + self.remove(&trash)?))
+    }
+
+    /// Locks every profile, then moves the whole target aside and deletes it.
+    fn delete_target(&self, target: &Target) -> Result<Outcome> {
+        if Target::classify(&target.root).map(|found| found.last_used) != Some(target.last_used) {
+            return Ok(Outcome::Skipped(
+                "Cargo used it while cendrillon was planning",
+            ));
+        }
+        if self.dry_run {
+            return Ok(Outcome::Freed(sys::tree_size(&target.root)));
+        }
+        let Some(locks) = lock_profiles(&target.root)? else {
+            return Ok(Outcome::Skipped("a Cargo build is running"));
+        };
+        let trash = move_to_trash(&target.root)?;
+        drop(locks);
+        self.remove(&trash).map(Outcome::Freed)
+    }
+
     fn remove(&self, path: &Path) -> Result<u64> {
         if self.dry_run {
             return Ok(sys::tree_size(path));
@@ -174,15 +247,52 @@ impl Executor<'_> {
     }
 }
 
+/// The locks a Cargo build holds on every profile of a target, or `None` if a build holds
+/// any of them: `.cargo-build-lock` (exclusive during a build) and `.cargo-lock` (shared by
+/// current Cargo, exclusive by older versions).
+fn lock_profiles(target: &Path) -> Result<Option<Vec<FileLock>>> {
+    let mut locks = Vec::new();
+    for profile in cargo::profiles(target) {
+        for name in [".cargo-build-lock", ".cargo-lock"] {
+            let path = profile.join(name);
+            match sys::try_flock(&path).with_context(|| format!("locking {}", path.display()))? {
+                Some(lock) => locks.push(lock),
+                None => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(locks))
+}
+
+/// Trash a trim left in a target when it was interrupted.
+fn trash_in(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TRASH_PREFIX)
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+fn stamp() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
 /// Renames `path` to a hidden sibling, so an interrupted deletion never leaves a half-deleted
 /// cache where Bazel would use it, and is finished on a later pass.
 fn move_to_trash(path: &Path) -> Result<PathBuf> {
     let name = path.file_name().context("no file name")?.to_string_lossy();
-    let stamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let trash = path.with_file_name(format!("{TRASH_PREFIX}{name}-{stamp}"));
+    let trash = path.with_file_name(format!("{TRASH_PREFIX}{name}-{}", stamp()));
     fs::rename(path, &trash).with_context(|| format!("renaming {}", path.display()))?;
     Ok(trash)
 }
@@ -219,6 +329,14 @@ fn describe(action: &Action) -> (String, String) {
                 reason.to_string(),
             )
         }
+        Action::TrimTarget(target) => (
+            format!("Cargo target {}", target.root.display()),
+            "build units nothing current depends on".into(),
+        ),
+        Action::DeleteTarget { target, reason } => (
+            format!("Cargo target {}", target.root.display()),
+            reason.to_string(),
+        ),
     }
 }
 
@@ -240,6 +358,7 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cargo::fixtures::Workspace;
     use crate::inventory::fixtures::{disk_cache, output_base, set_mtime};
     use crate::inventory::{Item, classify};
     use crate::planner::Reason;
@@ -252,6 +371,7 @@ mod tests {
         Executor {
             dry_run,
             stop: &RUNNING,
+            superseded_grace: Duration::ZERO,
         }
     }
 
@@ -403,6 +523,90 @@ mod tests {
 
         executor(false).run(&[Action::PurgeTrash(trash.clone())]);
         assert!(!trash.exists());
+    }
+
+    /// A workspace whose first build was superseded by enabling a feature.
+    fn superseded_workspace(dir: &Path) -> (Workspace, Target) {
+        let ws = Workspace::new(dir);
+        ws.cargo("build");
+        ws.enable_extra();
+        ws.cargo("build");
+        let target = Target::classify(&ws.target()).unwrap();
+        (ws, target)
+    }
+
+    fn unit_dirs(ws: &Workspace) -> usize {
+        fs::read_dir(ws.target().join("debug/.fingerprint"))
+            .unwrap()
+            .count()
+    }
+
+    #[test]
+    fn trims_superseded_units_and_the_next_build_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, target) = superseded_workspace(dir.path());
+        let before = unit_dirs(&ws);
+
+        assert!(executor(true).run(&[Action::TrimTarget(target.clone())]) > 0);
+        assert_eq!(unit_dirs(&ws), before);
+
+        assert!(executor(false).run(&[Action::TrimTarget(target.clone())]) > 0);
+        assert_eq!(unit_dirs(&ws), before - 2);
+        assert!(trash_in(&ws.target()).is_empty());
+        let build = ws.cargo("build");
+        assert!(!build.contains("Compiling"), "{build}");
+
+        assert_eq!(executor(false).run(&[Action::TrimTarget(target)]), 0);
+    }
+
+    #[test]
+    fn keeps_every_unit_while_cargo_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, target) = superseded_workspace(dir.path());
+        let before = unit_dirs(&ws);
+        let _build = LockHolder::flock_shared(&ws.target().join("debug/.cargo-lock"));
+
+        assert_eq!(
+            executor(false).run(&[Action::TrimTarget(target.clone())]),
+            0
+        );
+        assert_eq!(executor(false).run(&[delete_target(target)]), 0);
+        assert_eq!(unit_dirs(&ws), before);
+    }
+
+    fn delete_target(target: Target) -> Action {
+        Action::DeleteTarget {
+            target,
+            reason: Reason::Idle(HOUR),
+        }
+    }
+
+    #[test]
+    fn finishes_an_interrupted_trim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, target) = superseded_workspace(dir.path());
+        let leftover = ws.target().join(format!("{TRASH_PREFIX}1"));
+        fs::create_dir_all(leftover.join("0")).unwrap();
+        fs::write(leftover.join("0/libold.rlib"), vec![0u8; 10_000]).unwrap();
+
+        executor(false).run(&[Action::TrimTarget(target)]);
+        assert!(!leftover.exists());
+    }
+
+    #[test]
+    fn deletes_an_idle_target_unless_used_since_planning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, target) = superseded_workspace(dir.path());
+        let stale = Target {
+            last_used: target.last_used - HOUR,
+            ..target.clone()
+        };
+        assert_eq!(executor(false).run(&[delete_target(stale)]), 0);
+        assert!(ws.target().exists());
+
+        assert!(executor(false).run(&[delete_target(target)]) > 0);
+        assert!(!ws.target().exists());
+        assert!(trash_in(&ws.root).is_empty());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -78,6 +78,12 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Cargo units compiled at or after this time count as current.
+    pub fn cargo_live_since(&self, now: SystemTime) -> SystemTime {
+        now.checked_sub(self.superseded_grace)
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+
     /// Loads the config at `path`, or the defaults when the file does not exist.
     pub fn load(path: &Path) -> Result<Self> {
         let text = match std::fs::read_to_string(path) {

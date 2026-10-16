@@ -78,6 +78,7 @@ fn main() -> Result<()> {
                 executor: Executor {
                     dry_run: dry_run || config.dry_run,
                     stop: &stop,
+                    superseded_grace: config.superseded_grace,
                 },
             };
             let freed = cleaner.full_pass(&State::load(&env.state_file()))?;
@@ -98,7 +99,10 @@ fn main() -> Result<()> {
 
 fn status(env: &Env, config: &Config) -> Result<()> {
     let inventory = discovery::discover(env, &config.extra_roots, &State::load(&env.state_file()));
-    let usage = Usage::measure(inventory.items());
+    let usage = Usage::measure(
+        inventory.items(),
+        config.cargo_live_since(SystemTime::now()),
+    );
     let mut rows: Vec<(u64, Item)> = inventory
         .items()
         .map(|item| (usage.size(item.path()), item))
@@ -107,7 +111,7 @@ fn status(env: &Env, config: &Config) -> Result<()> {
 
     println!("{:>9}  {:>9}  {:<16}  PATH", "SIZE", "LAST USED", "KIND");
     for (size, item) in &rows {
-        let (kind, last_used, note) = describe(item);
+        let (kind, last_used, note) = describe(item, &usage);
         let last_used = last_used.map_or("-".into(), ago);
         let note = note.map(|note| format!("  ({note})")).unwrap_or_default();
         println!(
@@ -119,7 +123,7 @@ fn status(env: &Env, config: &Config) -> Result<()> {
     let total: u64 = rows.iter().map(|(size, _)| size).sum();
     let disk = DiskSpace::of(&env.home)?;
     println!(
-        "\n{} in Bazel caches. {} free of {} ({:.0}%).",
+        "\n{} in Bazel caches and Cargo targets. {} free of {} ({:.0}%).",
         format_bytes(total),
         format_bytes(disk.available),
         format_bytes(disk.total),
@@ -128,7 +132,7 @@ fn status(env: &Env, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn describe(item: &Item) -> (&'static str, Option<SystemTime>, Option<String>) {
+fn describe(item: &Item, usage: &Usage) -> (&'static str, Option<SystemTime>, Option<String>) {
     match item {
         Item::OutputBase(base) => {
             let workspace = match &base.workspace {
@@ -152,6 +156,14 @@ fn describe(item: &Item) -> (&'static str, Option<SystemTime>, Option<String>) {
             inventory::CacheKind::Disk => ("disk cache", None, None),
             inventory::CacheKind::Repository => ("repository cache", None, None),
         },
+        Item::CargoTarget(target) => (
+            "cargo target",
+            Some(target.last_used),
+            Some(format!(
+                "{} superseded",
+                format_bytes(usage.garbage(&target.root))
+            )),
+        ),
         Item::Trash(_) => ("trash", None, Some("deletion pending".into())),
     }
 }

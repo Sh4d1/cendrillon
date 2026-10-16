@@ -168,7 +168,7 @@ fn dead_incremental_dirs(
     }
     let mut dead = Vec::new();
     for (krate, mut dirs) in by_crate {
-        dirs.sort_by(|a, b| b.0.cmp(&a.0));
+        dirs.sort_by_key(|(used, _)| std::cmp::Reverse(*used));
         let keep = live_crates.get(krate.as_str()).copied().unwrap_or(0).max(1);
         dead.extend(dirs.into_iter().skip(keep).map(|(used, dir)| (dir, used)));
     }
@@ -390,7 +390,7 @@ fn read_node(json: &Path, hash_file: &Path, role: &str, dir: usize) -> Option<No
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     (0..text.len())
