@@ -83,7 +83,7 @@ impl Cleaner<'_> {
         });
         Ok(Pressure {
             bytes_to_free,
-            usage: Usage::measure(on_disk, self.config.cargo_retention()),
+            usage: Usage::measure(on_disk, self.config.unit_idle),
         })
     }
 }
@@ -114,7 +114,7 @@ pub fn run(env: &Env, config: &Config) -> Result<()> {
         executor: Executor {
             dry_run: config.dry_run,
             stop: &stop,
-            cargo: config.cargo_retention(),
+            unit_idle: config.unit_idle,
         },
     };
     let mut state = State::load(&env.state_file());

@@ -4,8 +4,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
-use crate::cargo::Retention;
-
 /// User settings, read from `~/.config/cendrillon/config.toml`. Every field is optional.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -21,19 +19,13 @@ pub struct Config {
     /// Delete an install base no output base points at once it is this old.
     #[serde(with = "humantime_serde")]
     pub install_base_idle: Duration,
-    /// Delete a Cargo build unit nothing current depends on once it was compiled this long
-    /// ago. Top-level units compiled within this window count as current, so switching back
-    /// to the previous branch soon after rebuilds nothing.
+    /// Delete a Cargo build unit Cargo has neither compiled nor read for this long, unless it
+    /// is the newest generation of a top-level unit or one of those needs it.
     #[serde(with = "humantime_serde")]
-    pub superseded_grace: Duration,
-    /// Delete a whole Cargo target directory when nothing has been built in it for this long.
+    pub unit_idle: Duration,
+    /// Delete a whole Cargo target directory when Cargo has used nothing in it for this long.
     #[serde(with = "humantime_serde")]
     pub target_idle: Duration,
-    /// Keep an older generation of a Cargo build unit this long after it was compiled when it
-    /// differs from the newest only in features or crate selection: `cargo check` next to
-    /// rust-analyzer's `--all-targets` check, `cargo test -p x`, clippy.
-    #[serde(with = "humantime_serde")]
-    pub variant_idle: Duration,
     /// Below this share of free disk space, evict the least recently used items early.
     pub pressure_free_percent: u8,
     /// Under pressure, evict until this share of the disk is free.
@@ -69,9 +61,8 @@ impl Default for Config {
             output_base_idle: 24 * HOUR,
             cache_entry_idle: 72 * HOUR,
             install_base_idle: 72 * HOUR,
-            superseded_grace: 2 * HOUR,
+            unit_idle: 24 * HOUR,
             target_idle: 7 * 24 * HOUR,
-            variant_idle: 24 * HOUR,
             pressure_free_percent: 15,
             target_free_percent: 25,
             recent_use_floor: 2 * HOUR,
@@ -86,13 +77,6 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn cargo_retention(&self) -> Retention {
-        Retention {
-            grace: self.superseded_grace,
-            variants: self.variant_idle,
-        }
-    }
-
     /// Loads the config at `path`, or the defaults when the file does not exist.
     pub fn load(path: &Path) -> Result<Self> {
         let text = match std::fs::read_to_string(path) {
@@ -139,7 +123,7 @@ mod tests {
             r#"
             dry_run = true
             output_base_idle = "3d"
-            superseded_grace = "30m"
+            unit_idle = "30m"
             pressure_free_percent = 20
             extra_roots = ["/Volumes/build/bazel"]
             "#,
@@ -150,9 +134,8 @@ mod tests {
         assert_eq!(config.pressure_free_percent, 20);
         assert_eq!(config.extra_roots, [PathBuf::from("/Volumes/build/bazel")]);
         assert_eq!(config.cache_entry_idle, 72 * HOUR);
-        assert_eq!(config.superseded_grace, HOUR / 2);
+        assert_eq!(config.unit_idle, HOUR / 2);
         assert_eq!(config.target_idle, 7 * 24 * HOUR);
-        assert_eq!(config.cargo_retention().variants, 24 * HOUR);
     }
 
     #[test]

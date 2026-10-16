@@ -2,30 +2,34 @@
 //! the ones nothing current depends on.
 //!
 //! Cargo never deletes a build unit. Every change of features, flags, toolchain or dependency
-//! versions compiles new generations of the affected crates next to the old ones. Cargo records
-//! no last-use time cendrillon could read (a Fresh build reads fingerprint files without writing
-//! them, and macOS does not refresh their access time), so liveness comes from the unit graph:
-//! each unit's `.fingerprint/<unit>/<role>.json` lists the fingerprints of the units it was
-//! built against. The newest generation of every top-level unit, and everything it depends
-//! on, is in use. The rest is garbage.
+//! versions compiles new generations of the affected crates next to the old ones. Each unit's
+//! `.fingerprint/<unit>/<role>.json` lists the fingerprints of the units it was built against,
+//! which gives the unit graph. In use are the newest generation of every top-level unit, the
+//! units Cargo read or compiled recently, and everything those depend on.
+//!
+//! A Fresh build writes nothing, but Cargo reads the fingerprint hash file of every unit in the
+//! build, and macOS records a read in the access time while that time is older than the
+//! modification time. [`record_reads`] notes the units read since its last call, then sets
+//! their access times back just before their modification times, so the next read shows too.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::fs::{self, FileTimes};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// When cendrillon saw Cargo read each unit. It lives in the target, so it goes with it.
+const READ_LOG: &str = ".cendrillon-reads.json";
 
 /// A Cargo target directory, `CARGO_TARGET_DIR`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub root: PathBuf,
-    /// When Cargo last compiled anything here or ran a build, even a Fresh one: rustc writes
-    /// outputs into `deps/` through renames, and a build rewrites the dep-info of its uplifted
-    /// outputs in the profile directory.
+    /// When Cargo last compiled, built (a build rewrites the dep-info of its uplifted outputs)
+    /// or, as of cendrillon's last pass, read anything here.
     pub last_used: SystemTime,
 }
 
@@ -36,7 +40,7 @@ impl Target {
         if !is_file(&dir.join(".rustc_info.json")) {
             return None;
         }
-        let last_used = profiles(dir)
+        let built = profiles(dir)
             .iter()
             .flat_map(|profile| {
                 [
@@ -47,9 +51,10 @@ impl Target {
             })
             .filter_map(|path| mtime(&path))
             .max()?;
+        let read = ReadLog::load(dir).latest();
         Some(Self {
             root: dir.to_path_buf(),
-            last_used,
+            last_used: read.map_or(built, |read| read.max(built)),
         })
     }
 }
@@ -85,6 +90,93 @@ fn is_profile(dir: &Path) -> bool {
     is_dir(&dir.join(".fingerprint")) && is_dir(&dir.join("deps"))
 }
 
+/// Notes which units Cargo read since the last call, and sets their hash files up to show the
+/// next read. Only access times change: Cargo goes by contents and modification times.
+pub fn record_reads(target: &Path) -> io::Result<()> {
+    let mut log = ReadLog::load(target);
+    let mut present = HashSet::new();
+    for profile in profiles(target) {
+        for unit in real_subdirs(&profile.join(".fingerprint")) {
+            let key = ReadLog::key(target, &unit);
+            for hash_file in hash_files(&unit) {
+                let meta = fs::symlink_metadata(&hash_file)?;
+                let (accessed, modified) = (meta.accessed()?, meta.modified()?);
+                if accessed > modified {
+                    log.record(&key, accessed);
+                }
+                if accessed >= modified {
+                    let armed = modified
+                        .checked_sub(Duration::from_secs(1))
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    fs::File::open(&hash_file)?.set_times(FileTimes::new().set_accessed(armed))?;
+                }
+            }
+            present.insert(key);
+        }
+    }
+    log.units.retain(|key, _| present.contains(key));
+    log.save(target)
+}
+
+/// The fingerprint hash file of each role of a unit: `<role>` next to `<role>.json`.
+fn hash_files(unit: &Path) -> Vec<PathBuf> {
+    entries(unit)
+        .into_iter()
+        .filter_map(|json| {
+            let role = json.file_name()?.to_str()?.strip_suffix(".json")?;
+            let hash_file = unit.join(role);
+            is_file(&hash_file).then_some(hash_file)
+        })
+        .collect()
+}
+
+/// Per unit directory, relative to the target, the last read cendrillon saw, in seconds.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ReadLog {
+    units: BTreeMap<String, u64>,
+}
+
+impl ReadLog {
+    fn load(target: &Path) -> Self {
+        fs::read(target.join(READ_LOG))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, target: &Path) -> io::Result<()> {
+        let temp = target.join(format!("{READ_LOG}.tmp"));
+        fs::write(&temp, serde_json::to_vec(self)?)?;
+        fs::rename(temp, target.join(READ_LOG))
+    }
+
+    fn key(target: &Path, unit: &Path) -> String {
+        unit.strip_prefix(target)
+            .unwrap_or(unit)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn record(&mut self, key: &str, time: SystemTime) {
+        let secs = time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entry = self.units.entry(key.to_owned()).or_default();
+        *entry = (*entry).max(secs);
+    }
+
+    fn get(&self, key: &str) -> Option<SystemTime> {
+        let secs = *self.units.get(key)?;
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+    }
+
+    fn latest(&self) -> Option<SystemTime> {
+        let secs = *self.units.values().max()?;
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+    }
+}
+
 /// Build output nothing current depends on: what trimming a target deletes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Garbage {
@@ -95,29 +187,19 @@ pub struct Garbage {
     pub incremental_dirs: usize,
 }
 
-/// How long superseded build units are kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Retention {
-    /// Top-level units compiled this recently are current, with everything they depend on, so
-    /// switching back to the previous branch soon after rebuilds nothing.
-    pub grace: Duration,
-    /// An older generation of a top-level unit that differs from the newest only in features
-    /// or in what the fingerprint does not record stays current this long. Commands used side
-    /// by side build such variants: `cargo check` and rust-analyzer's `--all-targets` check
-    /// unify features differently, `cargo clippy` looks exactly like `cargo check`.
-    pub variants: Duration,
-}
-
-/// Finds the garbage in `target`.
+/// Finds the garbage in `target`: units neither used within `unit_idle` of `now`, nor the
+/// newest generation of a top-level unit, nor needed by one of those.
 ///
 /// Reads fingerprint files and the first bytes of uplifted outputs, and lists directories;
-/// writes nothing. Fails rather than guess when a unit cannot be read, since what it depends on is unknown.
-pub fn garbage(target: &Path, retention: Retention, now: SystemTime) -> io::Result<Garbage> {
-    let live_since = before(now, retention.grace);
+/// writes nothing. Fails rather than guess when a unit cannot be read, since what it depends
+/// on is unknown.
+pub fn garbage(target: &Path, unit_idle: Duration, now: SystemTime) -> io::Result<Garbage> {
+    let recent = now.checked_sub(unit_idle).unwrap_or(SystemTime::UNIX_EPOCH);
     let profiles = profiles(target);
+    let log = ReadLog::load(target);
     let mut graph = Graph::default();
     for (index, profile) in profiles.iter().enumerate() {
-        graph.load(index, profile)?;
+        graph.load(index, profile, |unit| log.get(&ReadLog::key(target, unit)))?;
     }
     let unreadable = graph.dirs.iter().filter(|dir| dir.unknown).count();
     if unreadable > 0 {
@@ -131,14 +213,14 @@ pub fn garbage(target: &Path, retention: Retention, now: SystemTime) -> io::Resu
         .enumerate()
         .flat_map(|(index, profile)| graph.uplifted(index, profile))
         .collect();
-    let live = graph.live(retention, now, &uplifted);
+    let live = graph.live(recent, &uplifted);
 
     let mut garbage = Garbage::default();
     for (index, profile) in profiles.iter().enumerate() {
         let dead: HashMap<&str, &str> = graph
             .dirs
             .iter()
-            .filter(|dir| dir.profile == index && dir.is_dead(&graph.nodes, &live, live_since))
+            .filter(|dir| dir.profile == index && dir.is_dead(&graph.nodes, &live, recent))
             .map(|dir| (dir.hash(), dir.name.as_str()))
             .collect();
         garbage.units += dead.len();
@@ -159,7 +241,7 @@ pub fn garbage(target: &Path, retention: Retention, now: SystemTime) -> io::Resu
 
         let live_crates = graph.live_crates(index, &live);
         for (dir, used) in dead_incremental_dirs(&profile.join("incremental"), &live_crates) {
-            if used < live_since {
+            if used < recent {
                 garbage.incremental_dirs += 1;
                 garbage.paths.push(dir);
             }
@@ -216,15 +298,10 @@ fn dead_incremental_dirs(
 /// The parts of `<role>.json` that identify a unit and its dependencies.
 #[derive(Deserialize)]
 struct FingerprintJson {
-    rustc: u64,
     target: u64,
     profile: u64,
     path: u64,
     compile_kind: u64,
-    #[serde(default)]
-    config: u64,
-    #[serde(default)]
-    rustflags: Vec<String>,
     /// `[package hash, extern crate name, public, fingerprint]`.
     deps: Vec<(u64, String, bool, u64)>,
 }
@@ -245,16 +322,13 @@ struct UnitKey {
 struct Node {
     dir: usize,
     key: UnitKey,
-    /// Rustc version and flags. Generations built by another toolchain or with other flags are
-    /// out of date, not variants.
-    toolchain: u64,
     /// The value dependents record for it: the role's hash file, read as little-endian. Cargo
     /// empties the file when the unit failed to compile, so nothing can depend on it.
     fingerprint: Option<u64>,
     /// The crate's name as rustc and `--extern` know it, with `_` for `-`.
     crate_name: String,
-    /// The hash file is rewritten whenever the unit is compiled.
-    compiled: SystemTime,
+    /// When Cargo last compiled the unit (it rewrites the hash file) or read it.
+    last_used: SystemTime,
     /// `(package hash, extern crate name, fingerprint)` of each dependency.
     deps: Vec<(u64, String, u64)>,
     /// Running a build script compiles nothing, so it has no incremental directory.
@@ -267,7 +341,7 @@ struct UnitDir {
     profile: usize,
     name: String,
     nodes: Vec<usize>,
-    /// Some role in it could not be read or parsed, so the unit is kept.
+    /// Some role in it could not be read or parsed.
     unknown: bool,
 }
 
@@ -276,13 +350,13 @@ impl UnitDir {
         self.name.rsplit_once('-').map_or("", |(_, hash)| hash)
     }
 
-    fn is_dead(&self, nodes: &[Node], live: &HashSet<usize>, live_since: SystemTime) -> bool {
+    fn is_dead(&self, nodes: &[Node], live: &HashSet<usize>, recent: SystemTime) -> bool {
         !self.unknown
             && !self.nodes.is_empty()
             && self
                 .nodes
                 .iter()
-                .all(|&node| !live.contains(&node) && nodes[node].compiled < live_since)
+                .all(|&node| !live.contains(&node) && nodes[node].last_used < recent)
     }
 }
 
@@ -293,7 +367,13 @@ struct Graph {
 }
 
 impl Graph {
-    fn load(&mut self, profile_index: usize, profile: &Path) -> io::Result<()> {
+    /// Loads a profile's units; `logged` gives the last read recorded for a unit directory.
+    fn load(
+        &mut self,
+        profile_index: usize,
+        profile: &Path,
+        logged: impl Fn(&Path) -> Option<SystemTime>,
+    ) -> io::Result<()> {
         for entry in fs::read_dir(profile.join(".fingerprint"))? {
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -303,6 +383,7 @@ impl Graph {
                 continue;
             }
             let dir = self.dirs.len();
+            let logged = logged(&entry.path());
             let mut unit = UnitDir {
                 profile: profile_index,
                 name,
@@ -317,7 +398,7 @@ impl Graph {
                 else {
                     continue;
                 };
-                match read_node(&file, &entry.path().join(role), role, dir) {
+                match read_node(&file, &entry.path().join(role), role, dir, logged) {
                     Some(node) => {
                         unit.nodes.push(self.nodes.len());
                         self.nodes.push(node);
@@ -330,16 +411,9 @@ impl Graph {
         Ok(())
     }
 
-    /// Nodes in use: the newest generation of every top-level unit, the top-level units
-    /// `retention` keeps, the units of `uplifted` directories, and everything they depend on.
-    fn live(
-        &self,
-        retention: Retention,
-        now: SystemTime,
-        uplifted: &HashSet<usize>,
-    ) -> HashSet<usize> {
-        let live_since = before(now, retention.grace);
-        let variants_since = before(now, retention.variants);
+    /// Nodes in use: the newest generation of every top-level unit, the units of `uplifted`
+    /// directories, every unit used since `recent`, and everything they depend on.
+    fn live(&self, recent: SystemTime, uplifted: &HashSet<usize>) -> HashSet<usize> {
         let mut by_fingerprint: HashMap<u64, Vec<usize>> = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
             if let Some(fingerprint) = node.fingerprint {
@@ -354,37 +428,18 @@ impl Graph {
                 packages.entry(*package).or_default().push(dep);
             }
         }
-        let roots: Vec<usize> = (0..self.nodes.len())
-            .filter(|index| !referenced.contains(index))
-            .collect();
 
         let mut newest: HashMap<&UnitKey, usize> = HashMap::new();
-        for &index in &roots {
+        for index in (0..self.nodes.len()).filter(|index| !referenced.contains(index)) {
             let best = newest.entry(&self.nodes[index].key).or_insert(index);
-            if self.nodes[*best].compiled < self.nodes[index].compiled {
+            if self.nodes[*best].last_used < self.nodes[index].last_used {
                 *best = index;
             }
         }
-        let mut closures: HashMap<usize, Closure> = HashMap::new();
-        let mut pending: Vec<usize> = Vec::new();
-        for &index in &roots {
-            let node = &self.nodes[index];
-            let newest = newest[&node.key];
-            let current = node.compiled >= live_since
-                || (node.compiled >= variants_since
-                    && node.toolchain == self.nodes[newest].toolchain
-                    && is_variant(
-                        &self.closure(index, &by_fingerprint),
-                        closures
-                            .entry(newest)
-                            .or_insert_with(|| self.closure(newest, &by_fingerprint)),
-                    ));
-            if current {
-                pending.push(index);
-            }
-        }
-        pending.extend(newest.into_values());
+        let mut pending: Vec<usize> = newest.into_values().collect();
         pending.extend(uplifted.iter().flat_map(|&dir| &self.dirs[dir].nodes));
+        pending
+            .extend((0..self.nodes.len()).filter(|&index| self.nodes[index].last_used >= recent));
 
         let mut live = HashSet::new();
         let mut unresolved: Vec<(u64, &str)> = Vec::new();
@@ -470,54 +525,26 @@ impl Graph {
         }
         uplifted
     }
-
-    /// The crates a unit was built against, transitively, with the source paths of the
-    /// generations used: a registry crate's path names its version.
-    fn closure(&self, root: usize, by_fingerprint: &HashMap<u64, Vec<usize>>) -> Closure<'_> {
-        let mut crates: Closure = HashMap::new();
-        let mut seen = HashSet::from([root]);
-        let mut pending = vec![root];
-        while let Some(index) = pending.pop() {
-            for (_, _, fingerprint) in &self.nodes[index].deps {
-                for &dep in by_fingerprint.get(fingerprint).into_iter().flatten() {
-                    if seen.insert(dep) {
-                        let key = &self.nodes[dep].key;
-                        crates.entry(&key.role).or_default().insert(key.path);
-                        pending.push(dep);
-                    }
-                }
-            }
-        }
-        crates
-    }
-}
-
-/// Per dependency role, the source paths a unit was built against.
-type Closure<'a> = HashMap<&'a str, HashSet<u64>>;
-
-/// Whether two generations of a unit are variants, built with other features or crate
-/// selections, rather than one being out of date: no crate appears in both at different
-/// versions. A crate in only one of them, or at an extra version, is a feature difference.
-fn is_variant(a: &Closure, b: &Closure) -> bool {
-    a.iter().all(|(role, paths)| {
-        b.get(role)
-            .is_none_or(|other| paths.is_subset(other) || other.is_subset(paths))
-    })
 }
 
 /// Reads one role of a unit. `None` when anything is missing or unexpected, so the unit is
-/// kept rather than guessed at.
-fn read_node(json: &Path, hash_file: &Path, role: &str, dir: usize) -> Option<Node> {
+/// not guessed at.
+fn read_node(
+    json: &Path,
+    hash_file: &Path,
+    role: &str,
+    dir: usize,
+    logged: Option<SystemTime>,
+) -> Option<Node> {
     let parsed: FingerprintJson = serde_json::from_slice(&fs::read(json).ok()?).ok()?;
-    let hash = fs::read_to_string(hash_file).ok()?;
+    let (hash, compiled, accessed) = read_hash_file(hash_file).ok()?;
     let fingerprint = match hash.trim() {
         "" => None,
         hex => Some(u64::from_le_bytes(decode_hex(hex)?.try_into().ok()?)),
     };
-    let compiled = mtime(hash_file)?;
-    let crate_name = crate_name(role);
-    let mut toolchain = DefaultHasher::new();
-    (parsed.rustc, parsed.config, &parsed.rustflags).hash(&mut toolchain);
+    // Read since cendrillon last set the access time back.
+    let read = Some(accessed).filter(|&accessed| accessed > compiled);
+    let last_used = [Some(compiled), read, logged].into_iter().flatten().max()?;
     Some(Node {
         dir,
         key: UnitKey {
@@ -527,10 +554,9 @@ fn read_node(json: &Path, hash_file: &Path, role: &str, dir: usize) -> Option<No
             path: parsed.path,
             compile_kind: parsed.compile_kind,
         },
-        toolchain: toolchain.finish(),
         fingerprint,
-        crate_name,
-        compiled,
+        crate_name: crate_name(role),
+        last_used,
         deps: parsed
             .deps
             .into_iter()
@@ -540,8 +566,17 @@ fn read_node(json: &Path, hash_file: &Path, role: &str, dir: usize) -> Option<No
     })
 }
 
-fn before(now: SystemTime, duration: Duration) -> SystemTime {
-    now.checked_sub(duration).unwrap_or(SystemTime::UNIX_EPOCH)
+/// A hash file's contents, modification time and access time. Reading moves the access time,
+/// which is how cendrillon tells that Cargo read the file, so it is put back.
+fn read_hash_file(path: &Path) -> io::Result<(String, SystemTime, SystemTime)> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let meta = file.metadata()?;
+    let (modified, accessed) = (meta.modified()?, meta.accessed()?);
+    let mut hash = String::new();
+    file.read_to_string(&mut hash)?;
+    file.set_times(FileTimes::new().set_accessed(accessed))?;
+    Ok((hash, modified, accessed))
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -700,29 +735,37 @@ pub mod fixtures {
 
         /// Enables `dep/extra` from `app`, which makes new generations of both crates.
         pub fn enable_extra(&self) {
-            let manifest = self.root.join("app/Cargo.toml");
-            let text = fs::read_to_string(&manifest).unwrap().replace(
+            self.edit_app(
                 "dep = { path = \"../dep\" }",
                 "dep = { path = \"../dep\", features = [\"extra\"] }",
             );
-            fs::write(manifest, text).unwrap();
         }
 
         pub fn disable_extra(&self) {
-            let manifest = self.root.join("app/Cargo.toml");
-            let text = fs::read_to_string(&manifest).unwrap().replace(
+            self.edit_app(
                 "dep = { path = \"../dep\", features = [\"extra\"] }",
                 "dep = { path = \"../dep\" }",
             );
+        }
+
+        fn edit_app(&self, from: &str, to: &str) {
+            let manifest = self.root.join("app/Cargo.toml");
+            let text = fs::read_to_string(&manifest).unwrap().replace(from, to);
             fs::write(manifest, text).unwrap();
+        }
+
+        /// The unit directories of the debug profile.
+        pub fn units(&self) -> Vec<PathBuf> {
+            let mut units: Vec<PathBuf> = fs::read_dir(self.target().join("debug/.fingerprint"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            units.sort();
+            units
         }
 
         /// Runs a Cargo command and returns its `-v` output, which says what was Fresh.
         pub fn cargo(&self, command: &str) -> String {
-            self.cargo_with(command, &[])
-        }
-
-        pub fn cargo_with(&self, command: &str, env: &[(&str, &str)]) -> String {
             let output = Command::new("cargo")
                 .args([command, "--offline", "-v"])
                 .current_dir(&self.root)
@@ -730,7 +773,6 @@ pub mod fixtures {
                 .env_remove("RUSTFLAGS")
                 .env_remove("RUSTC_WORKSPACE_WRAPPER")
                 .env("CARGO_INCREMENTAL", "1")
-                .envs(env.iter().copied())
                 .output()
                 .unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -747,24 +789,27 @@ mod tests {
 
     const DAY: Duration = Duration::from_secs(24 * 3600);
 
-    fn keep(grace: Duration, variants: Duration) -> Retention {
-        Retention { grace, variants }
-    }
-
     /// Just after everything built so far.
     fn later() -> SystemTime {
         SystemTime::now() + Duration::from_secs(1)
     }
 
-    fn fingerprint_dirs(target: &Path, package: &str) -> usize {
-        entries(&target.join("debug/.fingerprint"))
-            .iter()
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.rsplit_once('-').is_some_and(|(p, _)| p == package))
-            })
-            .count()
+    fn remove(paths: &[PathBuf]) {
+        for path in paths {
+            fs::remove_dir_all(path)
+                .or_else(|_| fs::remove_file(path))
+                .unwrap();
+        }
+    }
+
+    /// Makes every unit look compiled `age` ago.
+    fn backdate(units: &[PathBuf], age: Duration) {
+        let time = filetime::FileTime::from_system_time(SystemTime::now() - age);
+        for unit in units {
+            for hash_file in hash_files(unit) {
+                filetime::set_file_times(&hash_file, time, time).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -787,38 +832,30 @@ mod tests {
     }
 
     #[test]
-    fn outdated_generations_are_garbage_and_the_next_builds_are_fresh() {
+    fn superseded_generations_are_garbage_and_the_next_builds_are_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path());
         ws.cargo("build");
         ws.cargo("check");
-        let none = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later());
-        assert_eq!(none.unwrap(), Garbage::default());
+        let none = garbage(&ws.target(), Duration::ZERO, later()).unwrap();
+        assert_eq!(none, Garbage::default());
 
         ws.enable_extra();
         ws.cargo("build");
         ws.cargo("check");
-        assert_eq!(fingerprint_dirs(&ws.target(), "dep"), 4);
+        assert_eq!(ws.units().len(), 8);
 
-        // Everything was compiled just now, so the grace period protects it all.
-        let protected = garbage(&ws.target(), keep(DAY, DAY), SystemTime::now());
-        assert_eq!(protected.unwrap().units, 0);
+        // Everything was compiled just now.
+        let recent = garbage(&ws.target(), DAY, SystemTime::now()).unwrap();
+        assert_eq!(recent.units, 0);
 
-        // Building with other features makes a variant, kept for as long as `variants` says.
-        let kept = garbage(&ws.target(), keep(Duration::ZERO, 7 * DAY), later()).unwrap();
-        assert_eq!(kept.units, 0, "{kept:#?}");
-
-        // After it: the first build's and the first check's app and dep go.
-        let found = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later()).unwrap();
+        // Past `unit_idle`, the first build's and the first check's app and dep go.
+        let found = garbage(&ws.target(), Duration::ZERO, later()).unwrap();
         assert_eq!(found.units, 4, "{found:#?}");
         assert_eq!(found.incremental_dirs, 4, "{found:#?}");
         let debug = ws.target().join("debug");
         assert!(found.paths.iter().all(|path| path.starts_with(&debug)));
-        for path in &found.paths {
-            fs::remove_dir_all(path)
-                .or_else(|_| fs::remove_file(path))
-                .unwrap();
-        }
+        remove(&found.paths);
 
         let build = ws.cargo("build");
         assert!(!build.contains("Compiling"), "{build}");
@@ -827,41 +864,101 @@ mod tests {
     }
 
     #[test]
-    fn variants_that_look_the_same_stay_current_for_a_while() {
+    fn an_older_generation_cargo_still_reads_stays() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path());
         ws.cargo("check");
-        // As `cargo clippy` does: same fingerprint, other unit directories.
-        ws.cargo_with("check", &[("RUSTC_WORKSPACE_WRAPPER", "/usr/bin/env")]);
-        assert_eq!(fingerprint_dirs(&ws.target(), "dep"), 2);
+        let first = ws.units();
+        ws.enable_extra();
+        ws.cargo("check");
+        let second: Vec<PathBuf> = ws
+            .units()
+            .into_iter()
+            .filter(|unit| !first.contains(unit))
+            .collect();
+        ws.disable_extra();
+        backdate(&first, 3 * DAY);
+        backdate(&second, 2 * DAY);
+        record_reads(&ws.target()).unwrap();
 
-        let found = garbage(&ws.target(), keep(Duration::ZERO, 7 * DAY), later()).unwrap();
-        assert_eq!(found.units, 0, "{found:#?}");
-        let found = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later());
-        assert_eq!(found.unwrap().units, 2);
+        // Nobody read the first generation since it was compiled three days ago.
+        assert_eq!(
+            garbage(&ws.target(), DAY, SystemTime::now()).unwrap().units,
+            2
+        );
+
+        // A Fresh check reads it, as rust-analyzer's does on every save. Now the second
+        // generation is the one nobody used for two days.
+        let check = ws.cargo("check");
+        assert!(!check.contains("Checking"), "{check}");
+        for found in [garbage(&ws.target(), DAY, SystemTime::now()).unwrap(), {
+            record_reads(&ws.target()).unwrap();
+            garbage(&ws.target(), DAY, SystemTime::now()).unwrap()
+        }] {
+            assert_eq!(found.units, 2, "{found:#?}");
+            let unit_paths: Vec<_> = found
+                .paths
+                .iter()
+                .filter(|path| {
+                    path.parent()
+                        .is_some_and(|dir| dir.ends_with(".fingerprint"))
+                })
+                .collect();
+            assert!(
+                unit_paths.iter().all(|path| second.contains(path)),
+                "{found:#?}"
+            );
+        }
+        assert!(
+            Target::classify(&ws.target())
+                .unwrap()
+                .last_used
+                .elapsed()
+                .unwrap()
+                < Duration::from_secs(600)
+        );
     }
 
     #[test]
-    fn other_flags_make_older_generations_out_of_date_at_once() {
+    fn record_reads_sets_hash_files_up_to_show_the_next_read() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path());
-        let flags = [("RUSTFLAGS", "--cfg cendrillon_test")];
         ws.cargo("build");
-        ws.cargo_with("build", &flags);
+        let read_since_armed = || -> usize {
+            ws.units()
+                .iter()
+                .flat_map(|unit| hash_files(unit))
+                .filter(|file| {
+                    let meta = fs::metadata(file).unwrap();
+                    meta.accessed().unwrap() > meta.modified().unwrap()
+                })
+                .count()
+        };
+        record_reads(&ws.target()).unwrap();
+        let mtimes: Vec<_> = ws
+            .units()
+            .iter()
+            .flat_map(|unit| hash_files(unit))
+            .map(|f| mtime(&f))
+            .collect();
+        assert_eq!(read_since_armed(), 0);
 
-        let found = garbage(&ws.target(), keep(Duration::ZERO, 7 * DAY), later()).unwrap();
-        assert_eq!(found.units, 2, "{found:#?}");
-        for path in &found.paths {
-            fs::remove_dir_all(path)
-                .or_else(|_| fs::remove_file(path))
-                .unwrap();
-        }
-        let build = ws.cargo_with("build", &flags);
-        assert!(!build.contains("Compiling"), "{build}");
+        ws.cargo("build");
+        assert_eq!(read_since_armed(), 2);
+        record_reads(&ws.target()).unwrap();
+        assert_eq!(read_since_armed(), 0);
+        assert_eq!(ReadLog::load(&ws.target()).units.len(), 2);
+        let after: Vec<_> = ws
+            .units()
+            .iter()
+            .flat_map(|unit| hash_files(unit))
+            .map(|f| mtime(&f))
+            .collect();
+        assert_eq!(mtimes, after, "modification times must not change");
     }
 
     #[test]
-    fn a_fresh_build_back_on_an_older_generation_keeps_it() {
+    fn the_uplifted_generation_stays_even_without_access_times() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path());
         ws.cargo("build");
@@ -870,9 +967,15 @@ mod tests {
         ws.disable_extra();
         let fresh = ws.cargo("build");
         assert!(!fresh.contains("Compiling"), "{fresh}");
+        // As on a volume that records no reads.
+        for hash_file in ws.units().iter().flat_map(|unit| hash_files(unit)) {
+            let modified = mtime(&hash_file).unwrap();
+            let before = filetime::FileTime::from_system_time(modified - Duration::from_secs(1));
+            filetime::set_file_atime(&hash_file, before).unwrap();
+        }
 
-        // The second build compiled last, but the uplifted `app` links to the first.
-        let found = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later()).unwrap();
+        // The second build compiled last, but the uplifted `app` is the first one's.
+        let found = garbage(&ws.target(), Duration::ZERO, later()).unwrap();
         assert_eq!(found.units, 0, "{found:#?}");
     }
 
@@ -893,7 +996,7 @@ mod tests {
             std::os::unix::fs::symlink(&outside, debug.join(sub)).unwrap();
         }
 
-        let found = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later()).unwrap();
+        let found = garbage(&ws.target(), Duration::ZERO, later()).unwrap();
         assert!(found.units > 0);
         let outside = fs::canonicalize(&outside).unwrap();
         for path in &found.paths {
@@ -909,13 +1012,12 @@ mod tests {
         ws.cargo("build");
         ws.enable_extra();
         ws.cargo("build");
-        let unit = entries(&ws.target().join("debug/.fingerprint")).remove(0);
-        for file in entries(&unit) {
+        for file in entries(&ws.units()[0]) {
             if file.extension().is_some_and(|ext| ext == "json") {
                 fs::write(&file, "not json").unwrap();
             }
         }
-        assert!(garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later()).is_err());
+        assert!(garbage(&ws.target(), Duration::ZERO, later()).is_err());
     }
 
     #[test]

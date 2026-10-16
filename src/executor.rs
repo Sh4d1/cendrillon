@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
-use crate::cargo::{self, Retention, Target};
+use crate::cargo::{self, Target};
 use crate::inventory::{
     self, Cache, CacheKind, InstallBase, OutputBase, TRASH_PREFIX, disk_cache_entries,
     repository_cache_entries,
@@ -24,8 +24,8 @@ pub struct Executor<'a> {
     pub dry_run: bool,
     /// Set by a signal handler; checked between deletions.
     pub stop: &'a AtomicBool,
-    /// How long superseded Cargo build units are kept.
-    pub cargo: Retention,
+    /// Cargo build units unused this long are trimmed.
+    pub unit_idle: Duration,
 }
 
 enum Outcome {
@@ -182,7 +182,7 @@ impl Executor<'_> {
             freed += self.remove(&leftover)?;
         }
         if self.dry_run {
-            let garbage = cargo::garbage(&target.root, self.cargo, SystemTime::now())?;
+            let garbage = cargo::garbage(&target.root, self.unit_idle, SystemTime::now())?;
             let bytes: u64 = garbage
                 .paths
                 .iter()
@@ -193,7 +193,9 @@ impl Executor<'_> {
         let Some(locks) = lock_profiles(&target.root)? else {
             return Ok(Outcome::Skipped("a Cargo build is running"));
         };
-        let garbage = cargo::garbage(&target.root, self.cargo, SystemTime::now())?;
+        cargo::record_reads(&target.root)
+            .with_context(|| format!("recording reads in {}", target.root.display()))?;
+        let garbage = cargo::garbage(&target.root, self.unit_idle, SystemTime::now())?;
         if garbage.paths.is_empty() {
             return Ok(Outcome::Freed(freed));
         }
@@ -228,6 +230,8 @@ impl Executor<'_> {
         };
         // Checked under the locks, so no build slips in after it. Creating a missing lock file
         // changes the profile's mtime: the target is then kept until the next pass.
+        cargo::record_reads(&target.root)
+            .with_context(|| format!("recording reads in {}", target.root.display()))?;
         if Target::classify(&target.root).map(|found| found.last_used) != Some(target.last_used) {
             return Ok(Outcome::Skipped(
                 "Cargo used it while cendrillon was planning",
@@ -370,10 +374,7 @@ mod tests {
         Executor {
             dry_run,
             stop: &RUNNING,
-            cargo: Retention {
-                grace: Duration::ZERO,
-                variants: Duration::ZERO,
-            },
+            unit_idle: Duration::ZERO,
         }
     }
 

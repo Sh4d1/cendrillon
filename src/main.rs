@@ -112,7 +112,7 @@ fn executor<'a>(config: &Config, dry_run: bool, stop: &'a AtomicBool) -> Executo
     Executor {
         dry_run: dry_run || config.dry_run,
         stop,
-        cargo: config.cargo_retention(),
+        unit_idle: config.unit_idle,
     }
 }
 
@@ -123,7 +123,7 @@ fn report(dry_run: bool, freed: u64) {
 
 fn status(env: &Env, config: &Config) -> Result<()> {
     let inventory = discovery::discover(env, &config.extra_roots, &State::load(&env.state_file()));
-    let usage = Usage::measure(inventory.items(), config.cargo_retention());
+    let usage = Usage::measure(inventory.items(), config.unit_idle);
     let mut rows: Vec<(u64, Item)> = inventory
         .items()
         .map(|item| (usage.size(item.path()), item))
