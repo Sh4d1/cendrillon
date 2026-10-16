@@ -311,7 +311,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = output_base(dir.path(), "base", Path::new("/gone"), SystemTime::now());
         let base = found_output_base(&path);
-        let _client = LockHolder::new(&path.join("lock"));
+        let _client = LockHolder::fcntl(&path.join("lock"));
 
         assert_eq!(executor(false).run(&[delete(base)]), 0);
         assert!(path.exists());

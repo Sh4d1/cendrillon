@@ -1,7 +1,7 @@
 //! Thin wrappers over the system calls the cleaner needs.
 
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -17,23 +17,27 @@ use nix::unistd::Pid;
 use walkdir::WalkDir;
 
 /// An exclusive advisory lock, released when dropped.
-///
-/// POSIX record locks belong to the process and are dropped when *any* descriptor of the
-/// file is closed, so nothing else in this process may open a locked file.
 pub struct FileLock {
     _file: File,
+}
+
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
 }
 
 /// Takes, without blocking, the lock Bazel takes on its lock files: an `fcntl` record lock on
 /// byte 0 (`blaze_util_posix.cc`, and Java's whole-file `FileChannel` locks, overlap it).
 /// Returns `None` when another process holds it.
+///
+/// POSIX record locks belong to the process and are dropped when *any* descriptor of the
+/// file is closed, so nothing else in this process may open a locked file.
 pub fn try_lock(path: &Path) -> io::Result<Option<FileLock>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
+    let file = open_lock_file(path)?;
     let request = libc::flock {
         l_start: 0,
         l_len: 1,
@@ -45,6 +49,18 @@ pub fn try_lock(path: &Path) -> io::Result<Option<FileLock>> {
         Ok(_) => Ok(Some(FileLock { _file: file })),
         Err(Errno::EAGAIN | Errno::EACCES) => Ok(None),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Takes, without blocking, an exclusive `flock` lock: the kind Cargo takes on its
+/// `.cargo-lock` files through `File::try_lock`. Returns `None` when another process holds
+/// it, shared or exclusive.
+pub fn try_flock(path: &Path) -> io::Result<Option<FileLock>> {
+    let file = open_lock_file(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(FileLock { _file: file })),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(e),
     }
 }
 
@@ -164,23 +180,36 @@ pub mod testing {
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
 
-    /// Holds Bazel's lock on a file from another process, as a Bazel client would, until
+    /// Holds a lock on a file from another process, as a Bazel client or Cargo would, until
     /// dropped.
     pub struct LockHolder(Child);
 
     impl LockHolder {
-        pub fn new(path: &Path) -> Self {
+        /// Bazel's `fcntl` record lock on byte 0.
+        pub fn fcntl(path: &Path) -> Self {
             // struct flock on macOS: off_t l_start, off_t l_len, pid_t l_pid, short l_type,
             // short l_whence.
-            let script = r#"
-                use Fcntl;
+            Self::spawn(
+                path,
+                r#"my $request = pack("q q l s s", 0, 1, 0, F_WRLCK, 0);
+                   fcntl($f, F_SETLK, $request) or die "lock: $!";"#,
+            )
+        }
+
+        /// Cargo's shared `flock`, as on `.cargo-lock` during a build.
+        pub fn flock_shared(path: &Path) -> Self {
+            Self::spawn(path, r#"flock($f, LOCK_SH | LOCK_NB) or die "lock: $!";"#)
+        }
+
+        fn spawn(path: &Path, lock: &str) -> Self {
+            let script = format!(
+                r#"use Fcntl qw(:DEFAULT :flock);
                 open(my $f, "+<", $ARGV[0]) or die "open: $!";
-                my $request = pack("q q l s s", 0, 1, 0, F_WRLCK, 0);
-                fcntl($f, F_SETLK, $request) or die "lock: $!";
-                $| = 1; print "locked\n"; <STDIN>;
-            "#;
+                {lock}
+                $| = 1; print "locked\n"; <STDIN>;"#
+            );
             let mut child = Command::new("perl")
-                .args(["-e", script])
+                .args(["-e", &script])
                 .arg(path)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -214,11 +243,24 @@ mod tests {
         let path = dir.path().join("lock");
         std::fs::write(&path, "").unwrap();
 
-        let holder = LockHolder::new(&path);
+        let holder = LockHolder::fcntl(&path);
         assert!(try_lock(&path).unwrap().is_none());
 
         drop(holder);
         assert!(try_lock(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn flock_is_refused_while_cargo_holds_it_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".cargo-lock");
+        std::fs::write(&path, "").unwrap();
+
+        let holder = LockHolder::flock_shared(&path);
+        assert!(try_flock(&path).unwrap().is_none());
+
+        drop(holder);
+        assert!(try_flock(&path).unwrap().is_some());
     }
 
     #[test]
