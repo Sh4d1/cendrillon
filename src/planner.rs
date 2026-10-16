@@ -66,7 +66,10 @@ impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Reason::WorkspaceDeleted(path) => write!(f, "workspace {} is gone", path.display()),
-            Reason::Idle(idle) => write!(f, "unused for {}", humantime::format_duration(*idle)),
+            Reason::Idle(idle) => {
+                let minutes = Duration::from_secs(idle.as_secs() / 60 * 60);
+                write!(f, "unused for {}", humantime::format_duration(minutes))
+            }
             Reason::DiskPressure => f.write_str("disk is nearly full"),
         }
     }

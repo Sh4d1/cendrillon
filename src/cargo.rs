@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -53,21 +54,30 @@ impl Target {
     }
 }
 
-/// Profile directories of a target: `<target>/<profile>` and, for cross builds and tools
-/// with their own target dir inside this one, `<target>/<dir>/<profile>`.
+/// Profile directories of a target: `<target>/<profile>`, `<target>/<triple>/<profile>` for
+/// cross builds, and the same inside a nested target dir such as rust-analyzer's
+/// `<target>/rust-analyzer`.
 pub fn profiles(target: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for child in real_subdirs(target) {
         if is_profile(&child) {
             found.push(child);
-        } else {
-            found.extend(
-                real_subdirs(&child)
-                    .into_iter()
-                    .filter(|dir| is_profile(dir)),
-            );
+            continue;
+        }
+        let nested_target = is_file(&child.join(".rustc_info.json"));
+        for grandchild in real_subdirs(&child) {
+            if is_profile(&grandchild) {
+                found.push(grandchild);
+            } else if nested_target {
+                found.extend(
+                    real_subdirs(&grandchild)
+                        .into_iter()
+                        .filter(|dir| is_profile(dir)),
+                );
+            }
         }
     }
+    found.sort();
     found
 }
 
@@ -92,15 +102,15 @@ pub struct Retention {
     /// switching back to the previous branch soon after rebuilds nothing.
     pub grace: Duration,
     /// An older generation of a top-level unit that differs from the newest only in ways the
-    /// fingerprint does not show stays current this long. `cargo clippy` and `cargo check`
-    /// builds of a workspace crate, or `-p` and `--workspace` builds unifying features
-    /// differently, look exactly like that, and both stay in use.
+    /// fingerprint does not record stays current this long: `cargo clippy` and `cargo check`
+    /// builds of a workspace crate look exactly like that, and both stay in use.
     pub variants: Duration,
 }
 
 /// Finds the garbage in `target`.
 ///
-/// Reads only the fingerprint JSON and hash files, and lists directories; writes nothing.
+/// Reads fingerprint files and the first bytes of uplifted outputs, and lists directories;
+/// writes nothing. Fails rather than guess when a unit cannot be read, since what it depends on is unknown.
 pub fn garbage(target: &Path, retention: Retention, now: SystemTime) -> io::Result<Garbage> {
     let live_since = before(now, retention.grace);
     let profiles = profiles(target);
@@ -108,7 +118,19 @@ pub fn garbage(target: &Path, retention: Retention, now: SystemTime) -> io::Resu
     for (index, profile) in profiles.iter().enumerate() {
         graph.load(index, profile)?;
     }
-    let live = graph.live(retention, now);
+    let unreadable = graph.dirs.iter().filter(|dir| dir.unknown).count();
+    if unreadable > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{unreadable} build units have fingerprints cendrillon cannot read"),
+        ));
+    }
+    let uplifted: HashSet<usize> = profiles
+        .iter()
+        .enumerate()
+        .flat_map(|(index, profile)| graph.uplifted(index, profile))
+        .collect();
+    let live = graph.live(retention, now, &uplifted);
 
     let mut garbage = Garbage::default();
     for (index, profile) in profiles.iter().enumerate() {
@@ -119,24 +141,16 @@ pub fn garbage(target: &Path, retention: Retention, now: SystemTime) -> io::Resu
             .map(|dir| (dir.hash(), dir.name.as_str()))
             .collect();
         garbage.units += dead.len();
+        let build = profile.join("build");
         for name in dead.values() {
             garbage.paths.push(profile.join(".fingerprint").join(name));
-            let build = profile.join("build").join(name);
-            if fs::symlink_metadata(&build).is_ok() {
-                garbage.paths.push(build);
+            if is_dir(&build) && fs::symlink_metadata(build.join(name)).is_ok() {
+                garbage.paths.push(build.join(name));
             }
         }
         for sub in ["deps", "examples"] {
             for entry in entries(&profile.join(sub)) {
-                let Some(name) = entry.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                // `lib<crate>-<hash>.rlib`, `<crate>-<hash>.<cgu>.rcgu.o`, `<crate>-<hash>.dSYM`
-                let stem = name.split('.').next().unwrap_or(name);
-                if stem
-                    .rsplit_once('-')
-                    .is_some_and(|(_, hash)| dead.contains_key(hash))
-                {
+                if unit_hash(&entry).is_some_and(|hash| dead.contains_key(hash)) {
                     garbage.paths.push(entry);
                 }
             }
@@ -153,9 +167,19 @@ pub fn garbage(target: &Path, retention: Retention, now: SystemTime) -> io::Resu
     Ok(garbage)
 }
 
-/// rustc keeps one incremental directory per compiled unit of a local crate. Keeps the newest
-/// ones of each crate, as many as it has live units and at least one, and returns the others
-/// with the time they were last written.
+/// The unit hash in an output's name: `lib<crate>-<hash>.rlib`, `<crate>-<hash>.<cgu>.rcgu.o`,
+/// `<crate>-<hash>.dSYM`, `<crate>-<hash>`.
+fn unit_hash(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.split('.').next()?;
+    let (_, hash) = stem.rsplit_once('-')?;
+    is_unit_hash(hash).then_some(hash)
+}
+
+/// rustc keeps one incremental directory per compiled unit of a local crate, named after the
+/// crate but not the unit. Keeps the most recently written ones of each crate, as many as it
+/// has live units and at least one, and returns the others with the time they were last
+/// written. A wrong pick costs one non-incremental compile of that crate.
 fn dead_incremental_dirs(
     incremental: &Path,
     live_crates: &HashMap<&str, usize>,
@@ -227,10 +251,12 @@ struct Node {
     own_shape: u64,
     /// The value dependents record for it: the role's hash file, read as little-endian.
     fingerprint: u64,
+    /// The crate's name as rustc and `--extern` know it, with `_` for `-`.
     crate_name: String,
     /// The hash file is rewritten whenever the unit is compiled.
     compiled: SystemTime,
-    deps: Vec<(String, u64)>,
+    /// `(package hash, extern crate name, fingerprint)` of each dependency.
+    deps: Vec<(u64, String, u64)>,
     /// Running a build script compiles nothing, so it has no incremental directory.
     compiles: bool,
 }
@@ -305,8 +331,13 @@ impl Graph {
     }
 
     /// Nodes in use: the newest generation of every top-level unit, the top-level units
-    /// `retention` keeps, and everything they depend on.
-    fn live(&self, retention: Retention, now: SystemTime) -> HashSet<usize> {
+    /// `retention` keeps, the units of `uplifted` directories, and everything they depend on.
+    fn live(
+        &self,
+        retention: Retention,
+        now: SystemTime,
+        uplifted: &HashSet<usize>,
+    ) -> HashSet<usize> {
         let live_since = before(now, retention.grace);
         let variants_since = before(now, retention.variants);
         let mut by_fingerprint: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -316,14 +347,14 @@ impl Graph {
                 .or_default()
                 .push(index);
         }
-        let referenced: HashSet<usize> = self
-            .nodes
-            .iter()
-            .flat_map(|node| &node.deps)
-            .filter_map(|(_, fingerprint)| by_fingerprint.get(fingerprint))
-            .flatten()
-            .copied()
-            .collect();
+        let mut referenced: HashSet<usize> = HashSet::new();
+        let mut packages: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (package, _, fingerprint) in self.nodes.iter().flat_map(|node| &node.deps) {
+            for &dep in by_fingerprint.get(fingerprint).into_iter().flatten() {
+                referenced.insert(dep);
+                packages.entry(*package).or_default().push(dep);
+            }
+        }
         let roots: Vec<usize> = (0..self.nodes.len())
             .filter(|index| !referenced.contains(index))
             .collect();
@@ -347,29 +378,29 @@ impl Graph {
             })
             .collect();
         pending.extend(newest.into_values());
+        pending.extend(uplifted.iter().flat_map(|&dir| &self.dirs[dir].nodes));
 
         let mut live = HashSet::new();
-        let mut unresolved: HashSet<&str> = HashSet::new();
+        let mut unresolved: Vec<(u64, &str)> = Vec::new();
         while let Some(index) = pending.pop() {
             if !live.insert(index) {
                 continue;
             }
-            for (name, fingerprint) in &self.nodes[index].deps {
+            for (package, name, fingerprint) in &self.nodes[index].deps {
                 match by_fingerprint.get(fingerprint) {
                     Some(deps) => pending.extend(deps),
                     // Built against a version of this dependency that has been rebuilt since,
                     // so the unit is dirty, and which generation its rebuild will use is
-                    // unknown: keep them all.
-                    None => {
-                        unresolved.insert(name);
-                    }
+                    // unknown: keep them all, found by package or by crate name.
+                    None => unresolved.push((*package, name)),
                 }
             }
         }
-        for (index, node) in self.nodes.iter().enumerate() {
-            if unresolved.contains(node.crate_name.as_str()) {
-                live.insert(index);
-            }
+        for (package, name) in unresolved {
+            live.extend(packages.get(&package).into_iter().flatten());
+            live.extend(
+                (0..self.nodes.len()).filter(|&index| self.nodes[index].crate_name == name),
+            );
         }
         live
     }
@@ -384,6 +415,54 @@ impl Graph {
             }
         }
         counts
+    }
+
+    /// Units whose outputs the last build uplifted into the profile directory, as
+    /// `<profile>/<name>` and `<profile>/examples/<name>`. A Fresh build uplifts again, so
+    /// they name what is in use even when another generation was compiled more recently.
+    fn uplifted(&self, profile_index: usize, profile: &Path) -> Vec<usize> {
+        // `app` uplifts `deps/app-<hash>`, `libapi.rlib` uplifts `deps/libapi-<hash>.rlib`.
+        let split = |path: &Path| -> Option<(String, String)> {
+            let name = path.file_name()?.to_str()?;
+            let (stem, rest) = name.split_at(name.find('.').unwrap_or(name.len()));
+            Some((stem.to_owned(), rest.to_owned()))
+        };
+        let mut outputs: HashMap<(String, String), PathBuf> = HashMap::new();
+        for dir in [profile.to_path_buf(), profile.join("examples")] {
+            for entry in entries(&dir) {
+                if unit_hash(&entry).is_none() && is_file(&entry) {
+                    outputs.extend(split(&entry).map(|name| (name, entry.clone())));
+                }
+            }
+        }
+        let by_hash: HashMap<&str, usize> = (0..self.dirs.len())
+            .filter(|&dir| self.dirs[dir].profile == profile_index)
+            .map(|dir| (self.dirs[dir].hash(), dir))
+            .collect();
+        let mut uplifted = Vec::new();
+        for sub in ["deps", "examples"] {
+            for entry in entries(&profile.join(sub)) {
+                let Some(hash) = unit_hash(&entry) else {
+                    continue;
+                };
+                let Some(&dir) = by_hash.get(hash) else {
+                    continue;
+                };
+                let Some((stem, rest)) = split(&entry) else {
+                    continue;
+                };
+                let Some(stem) = stem.strip_suffix(&format!("-{hash}")) else {
+                    continue;
+                };
+                if outputs
+                    .get(&(stem.to_owned(), rest))
+                    .is_some_and(|output| same_contents(output, &entry))
+                {
+                    uplifted.push(dir);
+                }
+            }
+        }
+        uplifted
     }
 
     /// Each node's own shape combined with its dependencies' shapes, recursively.
@@ -401,7 +480,7 @@ impl Graph {
             let node = &graph.nodes[index];
             visiting[index] = true;
             let mut deps: Vec<(&str, u64)> = Vec::new();
-            for (name, fingerprint) in &node.deps {
+            for (_, name, fingerprint) in &node.deps {
                 // A fingerprint is unique in practice; `visiting` only guards against a
                 // corrupt one pointing back up the graph.
                 let resolved = by_fingerprint
@@ -437,12 +516,7 @@ fn read_node(json: &Path, hash_file: &Path, role: &str, dir: usize) -> Option<No
     let hash = decode_hex(fs::read_to_string(hash_file).ok()?.trim())?;
     let fingerprint = u64::from_le_bytes(hash.try_into().ok()?);
     let compiled = mtime(hash_file)?;
-    // Crate names have no `-`, so a role ends with its crate name, except for build scripts.
-    let crate_name = if role.ends_with("build-script-build") {
-        "build_script_build"
-    } else {
-        role.rsplit_once('-')?.1
-    };
+    let crate_name = crate_name(role);
     let mut own_shape = DefaultHasher::new();
     (
         role,
@@ -467,12 +541,12 @@ fn read_node(json: &Path, hash_file: &Path, role: &str, dir: usize) -> Option<No
         },
         own_shape: own_shape.finish(),
         fingerprint,
-        crate_name: crate_name.to_owned(),
+        crate_name,
         compiled,
         deps: parsed
             .deps
             .into_iter()
-            .map(|(_, name, _, fingerprint)| (name, fingerprint))
+            .map(|(package, name, _, fingerprint)| (package, name, fingerprint))
             .collect(),
         compiles: !role.starts_with("run-"),
     })
@@ -492,13 +566,64 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// The crate a role compiles: role names are `<kind>-<target name>`, and the target name with
+/// `_` for `-` is the crate name.
+fn crate_name(role: &str) -> String {
+    ROLE_PREFIXES
+        .iter()
+        .find_map(|prefix| role.strip_prefix(prefix))
+        .unwrap_or(role)
+        .replace('-', "_")
+}
+
+const ROLE_PREFIXES: [&str; 11] = [
+    "run-build-script-",
+    "build-script-",
+    "test-integration-test-",
+    "test-example-",
+    "test-bench-",
+    "test-lib-",
+    "test-bin-",
+    "example-",
+    "bench-",
+    "lib-",
+    "bin-",
+];
+
 /// `<package>-<16 hex>`.
 fn is_unit_dir_name(name: &str) -> bool {
-    name.rsplit_once('-').is_some_and(|(package, hash)| {
-        !package.is_empty()
-            && hash.len() == 16
-            && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
+    name.rsplit_once('-')
+        .is_some_and(|(package, hash)| !package.is_empty() && is_unit_hash(hash))
+}
+
+/// Whether `copy` is a copy of `original`: Cargo hard-links uplifted outputs on some systems
+/// and clones them on macOS. Different builds differ early in the file (a Mach-O UUID, an
+/// rlib's metadata hash), so the length and first 64 KiB tell them apart.
+fn same_contents(copy: &Path, original: &Path) -> bool {
+    let (Ok(a), Ok(b)) = (fs::symlink_metadata(copy), fs::symlink_metadata(original)) else {
+        return false;
+    };
+    if (a.dev(), a.ino()) == (b.dev(), b.ino()) {
+        return true;
+    }
+    if !a.is_file() || !b.is_file() || a.len() != b.len() {
+        return false;
+    }
+    let head = |path: &Path| -> Option<Vec<u8>> {
+        use std::io::Read;
+        let mut buffer = Vec::new();
+        fs::File::open(path)
+            .ok()?
+            .take(64 * 1024)
+            .read_to_end(&mut buffer)
+            .ok()?;
+        Some(buffer)
+    };
+    head(copy).is_some_and(|copy| head(original) == Some(copy))
+}
+
+fn is_unit_hash(hash: &str) -> bool {
+    hash.len() == 16 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Subdirectories, not following symlinks, skipping hidden ones (cendrillon's own trash).
@@ -514,7 +639,12 @@ fn real_subdirs(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Entries of `dir`, or none if it is not a real directory: a symlink is never listed, so
+/// nothing found through one is ever deleted.
 fn entries(dir: &Path) -> Vec<PathBuf> {
+    if !is_dir(dir) {
+        return Vec::new();
+    }
     fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -586,6 +716,15 @@ pub mod fixtures {
             let text = fs::read_to_string(&manifest).unwrap().replace(
                 "dep = { path = \"../dep\" }",
                 "dep = { path = \"../dep\", features = [\"extra\"] }",
+            );
+            fs::write(manifest, text).unwrap();
+        }
+
+        pub fn disable_extra(&self) {
+            let manifest = self.root.join("app/Cargo.toml");
+            let text = fs::read_to_string(&manifest).unwrap().replace(
+                "dep = { path = \"../dep\", features = [\"extra\"] }",
+                "dep = { path = \"../dep\" }",
             );
             fs::write(manifest, text).unwrap();
         }
@@ -712,21 +851,76 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_units_are_kept() {
+    fn a_fresh_build_back_on_an_older_generation_keeps_it() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path());
         ws.cargo("build");
         ws.enable_extra();
         ws.cargo("build");
-        for path in entries(&ws.target().join("debug/.fingerprint")) {
-            for file in entries(&path) {
-                if file.extension().is_some_and(|ext| ext == "json") {
-                    fs::write(&file, "not json").unwrap();
-                }
+        ws.disable_extra();
+        let fresh = ws.cargo("build");
+        assert!(!fresh.contains("Compiling"), "{fresh}");
+
+        // The second build compiled last, but the uplifted `app` links to the first.
+        let found = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later()).unwrap();
+        assert_eq!(found.units, 0, "{found:#?}");
+    }
+
+    #[test]
+    fn never_deletes_through_a_symlinked_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path());
+        ws.cargo("build");
+        ws.enable_extra();
+        ws.cargo("build");
+        let outside = dir.path().join("outside");
+        for name in ["notes-1", "notes-2", "dep-0123456789abcdef"] {
+            fs::create_dir_all(outside.join(name)).unwrap();
+        }
+        let debug = ws.target().join("debug");
+        for sub in ["incremental", "examples", "build"] {
+            let _ = fs::remove_dir_all(debug.join(sub));
+            std::os::unix::fs::symlink(&outside, debug.join(sub)).unwrap();
+        }
+
+        let found = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later()).unwrap();
+        assert!(found.units > 0);
+        let outside = fs::canonicalize(&outside).unwrap();
+        for path in &found.paths {
+            let parent = fs::canonicalize(path.parent().unwrap()).unwrap();
+            assert!(!parent.starts_with(&outside), "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn refuses_to_trim_when_a_unit_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path());
+        ws.cargo("build");
+        ws.enable_extra();
+        ws.cargo("build");
+        let unit = entries(&ws.target().join("debug/.fingerprint")).remove(0);
+        for file in entries(&unit) {
+            if file.extension().is_some_and(|ext| ext == "json") {
+                fs::write(&file, "not json").unwrap();
             }
         }
-        let found = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later());
-        assert_eq!(found.unwrap().units, 0);
+        assert!(garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later()).is_err());
+    }
+
+    #[test]
+    fn crate_names_come_from_role_names() {
+        assert_eq!(crate_name("lib-alass_core"), "alass_core");
+        assert_eq!(crate_name("test-integration-test-my-test"), "my_test");
+        assert_eq!(crate_name("bin-my-tool"), "my_tool");
+        assert_eq!(
+            crate_name("build-script-build-script-build"),
+            "build_script_build"
+        );
+        assert_eq!(
+            crate_name("run-build-script-build-script-build"),
+            "build_script_build"
+        );
     }
 
     #[test]

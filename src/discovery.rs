@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::env::Env;
-use crate::inventory::{Inventory, Item, OutputBase, Workspace, classify};
+use crate::inventory::{Inventory, Item, OutputBase, TRASH_PREFIX, Workspace, classify};
 
 /// Deep enough to reach `<root>/<output_user_root>/install/<md5>`.
 const ROOT_DEPTH: usize = 3;
@@ -70,11 +70,11 @@ impl State {
     }
 }
 
-/// Everything Bazel keeps on disk that cendrillon knows how to find.
+/// Everything Bazel and Cargo keep on disk that cendrillon knows how to find.
 pub fn discover(env: &Env, extra_roots: &[PathBuf], state: &State) -> Inventory {
     let mut roots: BTreeSet<PathBuf> = default_roots(env).collect();
     roots.extend(extra_roots.iter().cloned());
-    roots.extend(state.roots.iter().cloned());
+    roots.extend(state.roots.iter().filter(|root| !is_skipped(root)).cloned());
     let global_rcs = [
         env.home.join(".bazelrc"),
         PathBuf::from("/etc/bazel.bazelrc"),
@@ -109,7 +109,37 @@ pub fn discover(env: &Env, extra_roots: &[PathBuf], state: &State) -> Inventory 
             .iter()
             .flat_map(|root| walk(root, ROOT_DEPTH, &env.home)),
     );
+    // A deletion of a whole root (a Cargo target) cut short leaves its trash beside it.
+    items.extend(
+        roots
+            .iter()
+            .filter(|root| fs::symlink_metadata(root).is_err())
+            .flat_map(|root| trash_beside(root)),
+    );
     items.into_iter().collect()
+}
+
+fn is_skipped(path: &Path) -> bool {
+    path.components()
+        .any(|part| SKIPPED_NAMES.iter().any(|skip| part.as_os_str() == *skip))
+}
+
+/// What renaming `root` to trash produced: `<parent>/.cendrillon-trash-<name>-<stamp>`.
+fn trash_beside(root: &Path) -> Vec<Item> {
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{TRASH_PREFIX}{}-", name.to_string_lossy());
+    fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with(&prefix)
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        })
+        .map(|entry| Item::Trash(entry.path()))
+        .collect()
 }
 
 /// Where Bazel puts caches unless told otherwise, plus the usual macOS cache directory.
@@ -385,6 +415,19 @@ mod tests {
         let roots = scan_home(&env);
         fs::set_permissions(&documents, mode(0o755)).unwrap();
         assert_eq!(roots, BTreeSet::from([env.home.join("src/a/b/c/disk")]));
+    }
+
+    #[test]
+    fn finds_the_trash_of_a_root_deleted_midway() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let trash = env.home.join("src/repo/.cendrillon-trash-target-1700");
+        fs::create_dir_all(trash.join("debug")).unwrap();
+        let state = State {
+            last_home_scan: None,
+            roots: BTreeSet::from([env.home.join("src/repo/target")]),
+        };
+        assert_eq!(discover(&env, &[], &state).trash, [trash]);
     }
 
     #[test]

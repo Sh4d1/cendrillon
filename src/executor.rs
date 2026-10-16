@@ -220,17 +220,19 @@ impl Executor<'_> {
 
     /// Locks every profile, then moves the whole target aside and deletes it.
     fn delete_target(&self, target: &Target) -> Result<Outcome> {
-        if Target::classify(&target.root).map(|found| found.last_used) != Some(target.last_used) {
-            return Ok(Outcome::Skipped(
-                "Cargo used it while cendrillon was planning",
-            ));
-        }
         if self.dry_run {
             return Ok(Outcome::Freed(sys::tree_size(&target.root)));
         }
         let Some(locks) = lock_profiles(&target.root)? else {
             return Ok(Outcome::Skipped("a Cargo build is running"));
         };
+        // Checked under the locks, so no build slips in after it. Creating a missing lock file
+        // changes the profile's mtime: the target is then kept until the next pass.
+        if Target::classify(&target.root).map(|found| found.last_used) != Some(target.last_used) {
+            return Ok(Outcome::Skipped(
+                "Cargo used it while cendrillon was planning",
+            ));
+        }
         let trash = move_to_trash(&target.root)?;
         drop(locks);
         self.remove(&trash).map(Outcome::Freed)
