@@ -1,6 +1,5 @@
-#![allow(dead_code)]
-
 mod config;
+mod daemon;
 mod discovery;
 mod env;
 mod executor;
@@ -8,4 +7,153 @@ mod inventory;
 mod planner;
 mod sys;
 
-fn main() {}
+use std::io::IsTerminal;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::time::SystemTime;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+use config::Config;
+use daemon::Cleaner;
+use discovery::State;
+use env::Env;
+use executor::{Executor, format_bytes};
+use inventory::{Item, Usage, Workspace};
+use sys::DiskSpace;
+
+/// Deletes the Bazel caches you no longer use, before they fill your disk.
+#[derive(Parser)]
+#[command(version)]
+struct Cli {
+    /// Config file [default: ~/.config/cendrillon/config.toml]
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List the Bazel caches found, with their size and last use.
+    Status,
+    /// Run one full cleaning pass now.
+    Clean {
+        /// Report what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Walk the home directory for Bazel caches in unusual places.
+    Scan,
+    /// Clean continuously in the foreground; this is what launchd runs.
+    Daemon,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
+
+    let env = Env::current()?;
+    let config = Config::load(&cli.config.unwrap_or_else(|| env.config_file()))?;
+    match cli.command {
+        Command::Status => status(&env, &config),
+        Command::Clean { dry_run } => {
+            let stop = AtomicBool::new(false);
+            let cleaner = Cleaner {
+                env: &env,
+                config: &config,
+                executor: Executor {
+                    dry_run: dry_run || config.dry_run,
+                    stop: &stop,
+                },
+            };
+            let freed = cleaner.pass(&State::load(&env.state_file()), true)?;
+            let verb = if cleaner.executor.dry_run {
+                "Would free"
+            } else {
+                "Freed"
+            };
+            println!("{verb} {}.", format_bytes(freed));
+            Ok(())
+        }
+        Command::Scan => daemon::scan_home(&env, &mut State::load(&env.state_file())),
+        Command::Daemon => daemon::run(&env, &config),
+    }
+}
+
+fn status(env: &Env, config: &Config) -> Result<()> {
+    let inventory = discovery::discover(env, &config.extra_roots, &State::load(&env.state_file()));
+    let usage = Usage::measure(&inventory);
+    let mut rows: Vec<(u64, Item)> = inventory
+        .items()
+        .map(|item| (usage.size(item.path()), item))
+        .collect();
+    rows.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
+
+    println!("{:>9}  {:>9}  {:<16}  PATH", "SIZE", "LAST USED", "KIND");
+    for (size, item) in &rows {
+        let (kind, last_used, note) = describe(item);
+        let last_used = last_used.map_or("-".into(), ago);
+        let note = note.map(|note| format!("  ({note})")).unwrap_or_default();
+        println!(
+            "{:>9}  {last_used:>9}  {kind:<16}  {}{note}",
+            format_bytes(*size),
+            item.path().display()
+        );
+    }
+    let total: u64 = rows.iter().map(|(size, _)| size).sum();
+    let disk = DiskSpace::of(&env.home)?;
+    println!(
+        "\n{} in Bazel caches. {} free of {} ({:.0}%).",
+        format_bytes(total),
+        format_bytes(disk.available),
+        format_bytes(disk.total),
+        disk.free_percent()
+    );
+    Ok(())
+}
+
+fn describe(item: &Item) -> (&'static str, Option<SystemTime>, Option<String>) {
+    match item {
+        Item::OutputBase(base) => {
+            let workspace = match &base.workspace {
+                Workspace::Present(path) => format!("workspace {}", path.display()),
+                Workspace::Missing(path) => format!("workspace deleted: {}", path.display()),
+                Workspace::Unreachable(path) => {
+                    format!("workspace unreachable: {}", path.display())
+                }
+                Workspace::Unrecorded => "workspace unknown".into(),
+            };
+            let server = sys::bazel_server(&base.path)
+                .map(|pid| format!(", server pid {pid}"))
+                .unwrap_or_default();
+            (
+                "output base",
+                Some(base.last_used),
+                Some(workspace + &server),
+            )
+        }
+        Item::InstallBase(base) => ("install base", Some(base.last_used), None),
+        Item::Cache(cache) => match cache.kind {
+            inventory::CacheKind::Disk => ("disk cache", None, None),
+            inventory::CacheKind::Repository => ("repository cache", None, None),
+        },
+        Item::Trash(_) => ("trash", None, Some("deletion pending".into())),
+    }
+}
+
+fn ago(time: SystemTime) -> String {
+    let secs = time.elapsed().unwrap_or_default().as_secs();
+    match secs {
+        0..3600 => format!("{}m ago", secs / 60),
+        3600..172_800 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
