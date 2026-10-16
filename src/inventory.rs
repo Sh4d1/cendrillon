@@ -258,6 +258,7 @@ pub fn disk_cache_entries(root: &Path) -> impl Iterator<Item = (PathBuf, fs::Met
     let excluded = [root.join("tmp"), root.join("gc")];
     WalkDir::new(root)
         .min_depth(1)
+        .sort_by_file_name()
         .into_iter()
         .filter_entry(move |entry| !excluded.iter().any(|dir| dir == entry.path()))
         .filter_map(Result::ok)
