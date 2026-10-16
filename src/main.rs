@@ -3,6 +3,7 @@
 mod config;
 mod discovery;
 mod env;
+mod executor;
 mod inventory;
 mod planner;
 mod sys;

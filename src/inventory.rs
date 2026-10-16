@@ -86,7 +86,7 @@ pub fn classify(dir: &Path) -> Option<Item> {
         return Some(Item::OutputBase(OutputBase {
             path: dir.to_path_buf(),
             workspace,
-            last_used: mtime(&dir.join("lock")).or_else(|_| mtime(dir)).ok()?,
+            last_used: last_used(dir).ok()?,
         }));
     }
     let in_install_dir = dir.parent()?.file_name() == Some("install".as_ref());
@@ -156,6 +156,11 @@ fn volume_mounted(path: &Path) -> bool {
 
 fn is_md5(name: &str) -> bool {
     name.len() == 32 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// When a Bazel command last ran in an output base.
+pub fn last_used(output_base: &Path) -> io::Result<SystemTime> {
+    mtime(&output_base.join("lock")).or_else(|_| mtime(output_base))
 }
 
 fn mtime(path: &Path) -> io::Result<SystemTime> {

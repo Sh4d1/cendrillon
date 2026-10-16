@@ -156,35 +156,54 @@ pub fn allocated(meta: &std::fs::Metadata, seen: &mut HashSet<(u64, u64)>) -> u6
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub mod testing {
     use std::io::{BufRead, BufReader};
-    use std::process::Stdio;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
 
-    /// Holds Bazel's lock on `path` from another process, as a Bazel client would.
-    fn hold_lock_elsewhere(path: &Path) -> std::process::Child {
-        // struct flock on macOS: off_t l_start, off_t l_len, pid_t l_pid, short l_type, short l_whence.
-        let script = r#"
-            use Fcntl;
-            open(my $f, "+<", $ARGV[0]) or die "open: $!";
-            my $request = pack("q q l s s", 0, 1, 0, F_WRLCK, 0);
-            fcntl($f, F_SETLK, $request) or die "lock: $!";
-            $| = 1; print "locked\n"; <STDIN>;
-        "#;
-        let mut child = Command::new("perl")
-            .args(["-e", script])
-            .arg(path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(child.stdout.as_mut().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        assert_eq!(line, "locked\n");
-        child
+    /// Holds Bazel's lock on a file from another process, as a Bazel client would, until
+    /// dropped.
+    pub struct LockHolder(Child);
+
+    impl LockHolder {
+        pub fn new(path: &Path) -> Self {
+            // struct flock on macOS: off_t l_start, off_t l_len, pid_t l_pid, short l_type,
+            // short l_whence.
+            let script = r#"
+                use Fcntl;
+                open(my $f, "+<", $ARGV[0]) or die "open: $!";
+                my $request = pack("q q l s s", 0, 1, 0, F_WRLCK, 0);
+                fcntl($f, F_SETLK, $request) or die "lock: $!";
+                $| = 1; print "locked\n"; <STDIN>;
+            "#;
+            let mut child = Command::new("perl")
+                .args(["-e", script])
+                .arg(path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(child.stdout.as_mut().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "locked\n");
+            Self(child)
+        }
     }
+
+    impl Drop for LockHolder {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.wait();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::LockHolder;
+    use super::*;
 
     #[test]
     fn lock_is_refused_while_another_process_holds_it() {
@@ -192,11 +211,10 @@ mod tests {
         let path = dir.path().join("lock");
         std::fs::write(&path, "").unwrap();
 
-        let mut holder = hold_lock_elsewhere(&path);
+        let holder = LockHolder::new(&path);
         assert!(try_lock(&path).unwrap().is_none());
 
-        drop(holder.stdin.take());
-        holder.wait().unwrap();
+        drop(holder);
         assert!(try_lock(&path).unwrap().is_some());
     }
 
