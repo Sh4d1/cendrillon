@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 
 use crate::inventory::{
     self, Cache, CacheKind, InstallBase, OutputBase, TRASH_PREFIX, disk_cache_entries,
+    repository_cache_entries,
 };
 use crate::planner::Action;
 use crate::sys;
@@ -73,16 +74,16 @@ impl Executor<'_> {
     /// Takes the output base lock so no Bazel command can start, stops the server, then moves
     /// the base aside and deletes it.
     fn delete_output_base(&self, base: &OutputBase) -> Result<Outcome> {
-        // Checked before locking, since locking creates a missing lock file. A command that
-        // starts in between holds the lock, so it is still caught below.
+        let Some(lock) = sys::try_lock(&base.path.join("lock"))? else {
+            return Ok(Outcome::Skipped("a Bazel command is running"));
+        };
+        // Opening the lock leaves its mtime alone. A lock file that was missing is created
+        // now, so the base is kept this pass and deleted on the next.
         if inventory::last_used(&base.path)? != base.last_used {
             return Ok(Outcome::Skipped(
                 "Bazel used it while cendrillon was planning",
             ));
         }
-        let Some(lock) = sys::try_lock(&base.path.join("lock"))? else {
-            return Ok(Outcome::Skipped("a Bazel command is running"));
-        };
         if self.dry_run {
             return Ok(Outcome::Freed(sys::tree_size(&base.path)));
         }
@@ -147,22 +148,19 @@ impl Executor<'_> {
         Ok(Outcome::Freed(freed))
     }
 
-    /// Entries are `content_addressable/<algo>/<hash>/` directories; Bazel touches their
-    /// `file` on every hit.
+    /// Bazel touches an entry's `file` on every hit.
     fn evict_repository_cache(&self, cache: &Cache, older_than: SystemTime) -> Result<Outcome> {
         let mut freed = 0;
-        for algo in subdirs(&cache.root.join("content_addressable"))? {
-            for entry in subdirs(&algo)? {
-                if self.stopped() {
-                    return Ok(Outcome::Freed(freed));
-                }
-                let last_used = children(&entry)?
-                    .filter_map(|path| fs::symlink_metadata(path).ok()?.modified().ok())
-                    .chain(fs::symlink_metadata(&entry)?.modified())
-                    .max();
-                if last_used.is_some_and(|time| time < older_than) {
-                    freed += self.remove(&entry)?;
-                }
+        for entry in repository_cache_entries(&cache.root) {
+            if self.stopped() {
+                break;
+            }
+            let last_used = fs::read_dir(&entry)?
+                .filter_map(|child| child.ok()?.metadata().ok()?.modified().ok())
+                .chain(fs::symlink_metadata(&entry)?.modified())
+                .max();
+            if last_used.is_some_and(|time| time < older_than) {
+                freed += self.remove(&entry)?;
             }
         }
         Ok(Outcome::Freed(freed))
@@ -193,18 +191,6 @@ fn remove_if_present(path: &Path) -> io::Result<bool> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-fn children(dir: &Path) -> io::Result<impl Iterator<Item = PathBuf>> {
-    Ok(fs::read_dir(dir)?.filter_map(|entry| Some(entry.ok()?.path())))
-}
-
-fn subdirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    match children(dir) {
-        Ok(paths) => Ok(paths.filter(|path| path.is_dir()).collect()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e),
     }
 }
@@ -337,7 +323,7 @@ mod tests {
         let install = dir.path().join("install");
         let path = install.join("e15394ac7311f82db7c708c94ae7eeac");
         fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("A-server.jar"), vec![0u8; 10_000]).unwrap();
+        fs::write(path.join("build-label.txt"), vec![0u8; 10_000]).unwrap();
         fs::write(install.join("e15394ac7311f82db7c708c94ae7eeac.lock"), "").unwrap();
         let Some(Item::InstallBase(base)) = classify(&path) else {
             panic!("not an install base");
@@ -388,7 +374,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let now = SystemTime::now();
         let sha = dir.path().join("content_addressable/sha256");
-        for (hash, mtime) in [("old", now - 100 * HOUR), ("new", now)] {
+        for (hash, mtime) in [("0a1d", now - 100 * HOUR), ("2e3f", now)] {
             fs::create_dir_all(sha.join(hash)).unwrap();
             fs::write(sha.join(hash).join("file"), "x").unwrap();
             set_mtime(&sha.join(hash).join("file"), mtime);
@@ -404,8 +390,8 @@ mod tests {
         };
 
         executor(false).run(&[action]);
-        assert!(!sha.join("old").exists());
-        assert!(sha.join("new/file").exists());
+        assert!(!sha.join("0a1d").exists());
+        assert!(sha.join("2e3f/file").exists());
     }
 
     #[test]

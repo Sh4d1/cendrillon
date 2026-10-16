@@ -36,10 +36,12 @@ cendrillon clean --dry-run   # what a full pass would delete right now
 | Repository cache downloads not used for 72 hours | Hourly sweep |
 | Install base (an extracted Bazel version) unused for 72 hours | Hourly sweep |
 
-When free space drops below 15%, idle output bases and disk-cache entries are deleted
-oldest first until 25% of the disk is free, without waiting for the deadlines above. Nothing
-used in the last 2 hours is touched, and pressure eviction runs at most every 10 minutes, so
-space that macOS releases late is not reclaimed twice.
+When free space drops below 15%, idle output bases and disk-cache entries on that disk are
+deleted oldest first until 25% of the disk is free, without waiting for the deadlines
+above. Nothing used in the last 2 hours is touched. Pressure rounds run at most every 10
+minutes. A round that does not raise free space pauses them for an hour, for example
+when local Time Machine snapshots still hold the deleted files, so cendrillon never
+deletes more and more without effect.
 
 Everything it deletes, Bazel can rebuild or download again. The repository contents cache
 (`contents/`) is left to Bazel's own `--repo_contents_cache_gc_*` settings, because live
@@ -56,7 +58,15 @@ external repositories point into it.
   Documents, Downloads, Pictures, Movies, Music, Public, and `~/Library` except
   `~/Library/Caches`), so it needs no Full Disk Access. It does not cross into other volumes.
 
-A workspace on an unmounted volume under `/Volumes` does not count as deleted.
+Recognition is strict, because anything recognized may be deleted:
+
+- An output base must contain both `DO_NOT_BUILD_HERE` and `README`, naming the same
+  absolute workspace path.
+- A disk cache must have only two-hex-digit shard directories under `ac/` and `cas/`.
+- An install base must sit in an `install/` directory and contain `build-label.txt`.
+
+A workspace counts as deleted only if its parent directory still exists and it is not on an
+unmounted volume under `/Volumes`.
 
 ## How it stays out of Bazel's way
 

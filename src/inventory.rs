@@ -1,13 +1,11 @@
 //! What Bazel keeps on disk: classifying directories and measuring them.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, FileType};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
-
-use walkdir::WalkDir;
 
 use crate::sys;
 
@@ -47,10 +45,9 @@ pub enum Workspace {
     Present(PathBuf),
     /// The workspace is gone, typically a deleted worktree; its output base is useless.
     Missing(PathBuf),
-    /// The workspace could not be checked: an unmounted volume or a permission error.
+    /// The workspace could not be checked: an unmounted volume, a missing parent directory or a
+    /// permission error.
     Unreachable(PathBuf),
-    /// The output base does not record its workspace.
-    Unrecorded,
 }
 
 /// An extracted Bazel binary: `<output_user_root>/install/<md5>`.
@@ -69,14 +66,15 @@ pub struct Cache {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheKind {
-    /// `--disk_cache`: `ac/` and `cas/` files, whose mtime Bazel bumps on every hit.
+    /// `--disk_cache`: `{ac,cas}/<2 hex>/<hash>` files, whose mtime Bazel bumps on every hit.
     Disk,
     /// `--repository_cache`: `content_addressable/<algo>/<hash>/file`, touched on every hit.
     /// The `contents/` repo contents cache is left to Bazel's own GC.
     Repository,
 }
 
-/// Recognizes a Bazel-managed directory from the markers Bazel leaves in it.
+/// Recognizes a Bazel-managed directory from the markers Bazel leaves in it. The checks are
+/// strict, because whatever matches under the home directory may be deleted.
 pub fn classify(dir: &Path) -> Option<Item> {
     let name = dir.file_name()?.to_str()?;
     if name.starts_with(TRASH_PREFIX) {
@@ -90,15 +88,21 @@ pub fn classify(dir: &Path) -> Option<Item> {
         }));
     }
     let in_install_dir = dir.parent()?.file_name() == Some("install".as_ref());
-    if in_install_dir && is_md5(name) {
+    if in_install_dir && is_hex(name, 32) && is_file(&dir.join("build-label.txt")) {
         return Some(Item::InstallBase(InstallBase {
             path: dir.to_path_buf(),
             last_used: mtime(dir).ok()?,
         }));
     }
-    let kind = if dir.join("ac").is_dir() && dir.join("cas").is_dir() {
+    let is_shard = |name: &str, kind: FileType| kind.is_dir() && is_hex(name, 2);
+    let kind = if ["ac", "cas"]
+        .iter()
+        .all(|sub| only_children(&dir.join(sub), is_shard))
+    {
         CacheKind::Disk
-    } else if dir.join("content_addressable").is_dir() {
+    } else if only_children(&dir.join("content_addressable"), |name, kind| {
+        kind.is_dir() && HASH_FUNCTIONS.contains(&name)
+    }) {
         CacheKind::Repository
     } else {
         return None;
@@ -109,26 +113,46 @@ pub fn classify(dir: &Path) -> Option<Item> {
     }))
 }
 
-/// The workspace an output base records, or `None` if `dir` is not an output base.
+const HASH_FUNCTIONS: [&str; 5] = ["sha1", "sha256", "sha384", "sha512", "blake3"];
+
+/// The workspace of an output base, or `None` if `dir` is not one. Bazel records the absolute
+/// workspace path in two files; both must agree.
 fn recorded_workspace(dir: &Path) -> Option<Workspace> {
-    if let Ok(text) = fs::read_to_string(dir.join("DO_NOT_BUILD_HERE")) {
-        let path = text.trim();
-        return Some(if path.is_empty() {
-            Workspace::Unrecorded
-        } else {
-            Workspace::check(PathBuf::from(path))
-        });
-    }
+    let marker = fs::read_to_string(dir.join("DO_NOT_BUILD_HERE")).ok()?;
     let readme = fs::read_to_string(dir.join("README")).ok()?;
-    let path = readme.lines().next()?.strip_prefix("WORKSPACE: ")?;
-    Some(Workspace::check(PathBuf::from(path)))
+    let path = Path::new(marker.trim());
+    let readme_path = readme.lines().next()?.strip_prefix("WORKSPACE: ")?;
+    (path.is_absolute() && Path::new(readme_path) == path)
+        .then(|| Workspace::check(path.to_path_buf()))
+}
+
+/// True when `dir` is a real directory whose entries, ignoring hidden ones such as
+/// `.DS_Store`, all pass `allowed`.
+fn only_children(dir: &Path, allowed: impl Fn(&str, FileType) -> bool) -> bool {
+    if !fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.into_iter().all(|entry| {
+        entry.is_ok_and(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with('.') || entry.file_type().is_ok_and(|kind| allowed(&name, kind))
+        })
+    })
 }
 
 impl Workspace {
     fn check(path: PathBuf) -> Self {
         match fs::symlink_metadata(&path) {
             Ok(_) => Workspace::Present(path),
-            Err(e) if e.kind() == io::ErrorKind::NotFound && volume_mounted(&path) => {
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    && path.parent().is_some_and(Path::is_dir)
+                    && volume_mounted(&path) =>
+            {
                 Workspace::Missing(path)
             }
             Err(_) => Workspace::Unreachable(path),
@@ -154,8 +178,12 @@ fn volume_mounted(path: &Path) -> bool {
     }
 }
 
-fn is_md5(name: &str) -> bool {
-    name.len() == 32 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+fn is_hex(name: &str, len: usize) -> bool {
+    name.len() == len && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 /// When a Bazel command last ran in an output base.
@@ -217,10 +245,10 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Walks every item. Slow on large caches: run it only when sizes matter.
-    pub fn measure(inventory: &Inventory) -> Self {
+    /// Walks the given items. Slow on large caches: run it only when sizes matter.
+    pub fn measure(items: impl IntoIterator<Item = Item>) -> Self {
         let mut usage = Usage::default();
-        for item in inventory.items() {
+        for item in items {
             let path = item.path().to_path_buf();
             let size = match &item {
                 Item::Cache(cache) if cache.kind == CacheKind::Disk => {
@@ -253,17 +281,58 @@ fn disk_cache_ages(root: &Path) -> BTreeMap<SystemTime, u64> {
     ages
 }
 
-/// Files of a disk cache, skipping the `tmp/` and `gc/` directories as Bazel's GC does.
+/// Files of a disk cache: `{ac,cas}/<2 hex>/<hash>`, `ac/` first. Like Bazel's GC, this
+/// leaves `tmp/` and `gc/` alone.
 pub fn disk_cache_entries(root: &Path) -> impl Iterator<Item = (PathBuf, fs::Metadata)> {
-    let excluded = [root.join("tmp"), root.join("gc")];
-    WalkDir::new(root)
-        .min_depth(1)
-        .sort_by_file_name()
+    ["ac", "cas"]
         .into_iter()
-        .filter_entry(move |entry| !excluded.iter().any(|dir| dir == entry.path()))
+        .flat_map(move |sub| subdirs(&root.join(sub), |name| is_hex(name, 2)))
+        .flat_map(|shard| {
+            let mut files: Vec<_> = fs::read_dir(shard)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let meta = entry.metadata().ok()?;
+                    meta.is_file().then(|| (entry.path(), meta))
+                })
+                .collect();
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            files
+        })
+}
+
+/// Entries of a repository cache: `content_addressable/<algo>/<hex hash>/` directories.
+pub fn repository_cache_entries(root: &Path) -> impl Iterator<Item = PathBuf> {
+    subdirs(&root.join("content_addressable"), |name| {
+        HASH_FUNCTIONS.contains(&name)
+    })
+    .into_iter()
+    .flat_map(|algo| {
+        subdirs(&algo, |name| {
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+    })
+}
+
+/// Subdirectories of `dir` with an accepted name, sorted. Symlinks, including `dir` itself,
+/// are not followed.
+fn subdirs(dir: &Path, accepted: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    if !fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return Vec::new();
+    }
+    let mut dirs: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .filter_map(|entry| Some((entry.path().to_path_buf(), entry.metadata().ok()?)))
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry.file_name().to_str().is_some_and(&accepted)
+        })
+        .map(|entry| entry.path())
+        .collect();
+    dirs.sort();
+    dirs
 }
 
 pub fn bucket_start(time: SystemTime) -> SystemTime {
@@ -316,7 +385,7 @@ pub mod fixtures {
     }
 
     pub fn disk_cache(root: &Path, entries: &[(&str, SystemTime)]) -> PathBuf {
-        for dir in ["ac", "cas", "tmp", "gc"] {
+        for dir in ["ac/00", "cas/00", "tmp", "gc"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         for (path, mtime) in entries {
@@ -361,6 +430,7 @@ mod tests {
     fn deleted_worktree_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let gone = dir.path().join("worktrees/gone");
+        fs::create_dir(dir.path().join("worktrees")).unwrap();
         let base = output_base(dir.path(), "base", &gone, SystemTime::now());
         let Some(Item::OutputBase(found)) = classify(&base) else {
             panic!("not an output base");
@@ -375,19 +445,38 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_readme_for_the_workspace() {
+    fn output_base_needs_both_markers_naming_the_same_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
-        let base = output_base(
-            dir.path(),
-            "base",
-            Path::new("/nonexistent"),
-            SystemTime::now(),
-        );
+        let base = output_base(dir.path(), "base", Path::new("/gone"), SystemTime::now());
+        assert!(matches!(classify(&base), Some(Item::OutputBase(_))));
+
+        fs::write(base.join("DO_NOT_BUILD_HERE"), "/other").unwrap();
+        assert_eq!(classify(&base), None);
+
+        fs::write(base.join("DO_NOT_BUILD_HERE"), "see README").unwrap();
+        fs::write(base.join("README"), "WORKSPACE: see README\n").unwrap();
+        assert_eq!(classify(&base), None);
+
         fs::remove_file(base.join("DO_NOT_BUILD_HERE")).unwrap();
-        let Some(Item::OutputBase(found)) = classify(&base) else {
-            panic!("not an output base");
-        };
-        assert_eq!(found.workspace, Workspace::Missing("/nonexistent".into()));
+        assert_eq!(classify(&base), None);
+    }
+
+    #[test]
+    fn folders_that_merely_resemble_caches_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("notes");
+        fs::create_dir_all(disk.join("ac/00")).unwrap();
+        fs::create_dir_all(disk.join("cas")).unwrap();
+        fs::write(disk.join("cas/todo.txt"), "").unwrap();
+        assert_eq!(classify(&disk), None);
+
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("content_addressable/photos")).unwrap();
+        assert_eq!(classify(&repo), None);
+
+        let install = dir.path().join("install/e15394ac7311f82db7c708c94ae7eeac");
+        fs::create_dir_all(&install).unwrap();
+        assert_eq!(classify(&install), None);
     }
 
     #[test]
@@ -395,6 +484,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let install = dir.path().join("install/e15394ac7311f82db7c708c94ae7eeac");
         fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("build-label.txt"), "9.2.0").unwrap();
         assert!(matches!(classify(&install), Some(Item::InstallBase(_))));
         assert_eq!(classify(&dir.path().join("install")), None);
 
@@ -441,7 +531,7 @@ mod tests {
             ],
         );
         let inventory: Inventory = classify(&cache).into_iter().collect();
-        let usage = Usage::measure(&inventory);
+        let usage = Usage::measure(inventory.items());
         let ages = &usage.ages[&cache];
         assert_eq!(ages.len(), 2);
         assert_eq!(ages[&bucket_start(old)], 2 * ages[&bucket_start(now)]);

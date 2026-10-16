@@ -309,7 +309,9 @@ mod tests {
         let user_root = env.home.join("Library/Caches/bazel/_bazel_test");
         let now = SystemTime::now();
         output_base(&user_root, "aaaa", &workspace, now);
-        fs::create_dir_all(user_root.join("install/e15394ac7311f82db7c708c94ae7eeac")).unwrap();
+        let install = user_root.join("install/e15394ac7311f82db7c708c94ae7eeac");
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("build-label.txt"), "9.2.0").unwrap();
         disk_cache(&elsewhere, &[]);
 
         let inventory = discover(&env, &[], &State::default());
