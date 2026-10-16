@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use config::Config;
@@ -25,7 +25,7 @@ use executor::{Executor, format_bytes};
 use inventory::{Item, Usage, Workspace};
 use sys::DiskSpace;
 
-/// Deletes the Bazel caches you no longer use, before they fill your disk.
+/// Deletes the Bazel caches and Cargo build output you no longer use, before they fill your disk.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -38,7 +38,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List the Bazel caches found, with their size and last use.
+    /// List the Bazel caches and Cargo targets found, with their size and last use.
     Status,
     /// Run one full cleaning pass now.
     Clean {
@@ -46,7 +46,15 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Walk the home directory for Bazel caches in unusual places.
+    /// Delete the build units of one Cargo target that nothing current depends on.
+    Trim {
+        /// The target directory, usually `<workspace>/target`.
+        target: PathBuf,
+        /// Report what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Walk the home directory for caches and targets in unusual places.
     Scan,
     /// Clean continuously in the foreground; this is what launchd runs.
     Daemon,
@@ -75,19 +83,22 @@ fn main() -> Result<()> {
             let cleaner = Cleaner {
                 env: &env,
                 config: &config,
-                executor: Executor {
-                    dry_run: dry_run || config.dry_run,
-                    stop: &stop,
-                    cargo: config.cargo_retention(),
-                },
+                executor: executor(&config, dry_run, &stop),
             };
             let freed = cleaner.full_pass(&State::load(&env.state_file()))?;
-            let verb = if cleaner.executor.dry_run {
-                "Would free"
-            } else {
-                "Freed"
-            };
-            println!("{verb} {}.", format_bytes(freed));
+            report(cleaner.executor.dry_run, freed);
+            Ok(())
+        }
+        Command::Trim { target, dry_run } => {
+            let root = target
+                .canonicalize()
+                .with_context(|| format!("reading {}", target.display()))?;
+            let target = cargo::Target::classify(&root)
+                .with_context(|| format!("{} is not a Cargo target directory", root.display()))?;
+            let stop = AtomicBool::new(false);
+            let executor = executor(&config, dry_run, &stop);
+            let freed = executor.run(&[planner::Action::TrimTarget(target)]);
+            report(executor.dry_run, freed);
             Ok(())
         }
         Command::Scan => daemon::scan_home(&env, &mut State::load(&env.state_file())),
@@ -95,6 +106,19 @@ fn main() -> Result<()> {
         Command::Install => launchd::install(&env),
         Command::Uninstall => launchd::uninstall(&env),
     }
+}
+
+fn executor<'a>(config: &Config, dry_run: bool, stop: &'a AtomicBool) -> Executor<'a> {
+    Executor {
+        dry_run: dry_run || config.dry_run,
+        stop,
+        cargo: config.cargo_retention(),
+    }
+}
+
+fn report(dry_run: bool, freed: u64) {
+    let verb = if dry_run { "Would free" } else { "Freed" };
+    println!("{verb} {}.", format_bytes(freed));
 }
 
 fn status(env: &Env, config: &Config) -> Result<()> {
