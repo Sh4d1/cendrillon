@@ -19,6 +19,14 @@ pub struct Config {
     /// Delete an install base no output base points at once it is this old.
     #[serde(with = "humantime_serde")]
     pub install_base_idle: Duration,
+    /// Delete a Cargo build unit nothing current depends on once it was compiled this long
+    /// ago. Top-level units compiled within this window count as current, so switching back
+    /// to the previous branch soon after rebuilds nothing.
+    #[serde(with = "humantime_serde")]
+    pub superseded_grace: Duration,
+    /// Delete a whole Cargo target directory when nothing has been built in it for this long.
+    #[serde(with = "humantime_serde")]
+    pub target_idle: Duration,
     /// Below this share of free disk space, evict the least recently used items early.
     pub pressure_free_percent: u8,
     /// Under pressure, evict until this share of the disk is free.
@@ -54,6 +62,8 @@ impl Default for Config {
             output_base_idle: 24 * HOUR,
             cache_entry_idle: 72 * HOUR,
             install_base_idle: 72 * HOUR,
+            superseded_grace: 2 * HOUR,
+            target_idle: 7 * 24 * HOUR,
             pressure_free_percent: 15,
             target_free_percent: 25,
             recent_use_floor: 2 * HOUR,
@@ -90,6 +100,7 @@ impl Config {
             ("sweep_interval", config.sweep_interval),
             ("pressure_cooldown", config.pressure_cooldown),
             ("home_scan_interval", config.home_scan_interval),
+            ("target_idle", config.target_idle),
         ];
         for (name, interval) in intervals {
             ensure!(!interval.is_zero(), "{name} must be positive");
@@ -113,6 +124,7 @@ mod tests {
             r#"
             dry_run = true
             output_base_idle = "3d"
+            superseded_grace = "30m"
             pressure_free_percent = 20
             extra_roots = ["/Volumes/build/bazel"]
             "#,
@@ -123,6 +135,8 @@ mod tests {
         assert_eq!(config.pressure_free_percent, 20);
         assert_eq!(config.extra_roots, [PathBuf::from("/Volumes/build/bazel")]);
         assert_eq!(config.cache_entry_idle, 72 * HOUR);
+        assert_eq!(config.superseded_grace, HOUR / 2);
+        assert_eq!(config.target_idle, 7 * 24 * HOUR);
     }
 
     #[test]
@@ -130,6 +144,7 @@ mod tests {
         assert!(Config::parse("output_base_ttl = \"1h\"").is_err());
         assert!(Config::parse("pressure_free_percent = 30").is_err());
         assert!(Config::parse("pressure_cooldown = \"0s\"").is_err());
+        assert!(Config::parse("target_idle = \"0s\"").is_err());
     }
 
     #[test]
