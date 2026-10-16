@@ -86,16 +86,17 @@ pub fn bazel_server(output_base: &Path) -> Option<Pid> {
     let pid = Pid::from_raw(text.trim().parse().ok()?);
     kill(pid, None).ok()?;
     let ps = Command::new("/bin/ps")
-        .args(["-o", "command=", "-p"])
+        .args(["-ww", "-o", "command=", "-p"])
         .arg(pid.to_string())
         .output()
         .ok()?;
     let command = String::from_utf8_lossy(&ps.stdout);
-    let flag = format!("--output_base={}", output_base.display());
-    command
-        .split_whitespace()
-        .any(|arg| arg == flag)
-        .then_some(pid)
+    // The value runs to the next flag, so paths with spaces survive.
+    let (_, rest) = command.split_once("--output_base=")?;
+    let named = Path::new(rest.split(" --").next()?.trim_end());
+    let same = named == output_base
+        || std::fs::canonicalize(named).ok()? == std::fs::canonicalize(output_base).ok()?;
+    same.then_some(pid)
 }
 
 /// Stops a process: SIGTERM, then SIGKILL if it is still alive after `grace`.
@@ -121,6 +122,7 @@ pub fn terminate(pid: Pid, grace: Duration) -> io::Result<()> {
 pub fn tree_size(path: &Path) -> u64 {
     let mut seen = HashSet::new();
     WalkDir::new(path)
+        .follow_root_links(false)
         .into_iter()
         .filter_map(Result::ok)
         .filter_map(|entry| entry.metadata().ok())
@@ -135,7 +137,8 @@ pub fn remove_tree(path: &Path) -> io::Result<u64> {
     let mut seen = HashSet::new();
     let mut size = 0;
     // Pre-order, so a directory is made readable before the walk lists it.
-    for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
+    let entries = WalkDir::new(path).follow_root_links(false);
+    for entry in entries.into_iter().filter_map(Result::ok) {
         let Ok(meta) = entry.metadata() else { continue };
         size += allocated(&meta, &mut seen);
         let mode = meta.permissions().mode();
