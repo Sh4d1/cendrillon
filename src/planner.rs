@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::config::Config;
-use crate::inventory::{AGE_BUCKET, Cache, CacheKind, Inventory, Usage, Workspace};
+use crate::inventory::{AGE_BUCKET, Cache, Inventory, Usage, Workspace};
 
 #[derive(Debug)]
 pub enum Sweep {
@@ -197,7 +197,7 @@ enum Candidate<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inventory::{InstallBase, OutputBase, bucket_start};
+    use crate::inventory::{CacheKind, InstallBase, OutputBase, bucket_start};
     use std::collections::BTreeMap;
 
     const HOUR: Duration = Duration::from_secs(3600);
