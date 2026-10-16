@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::config::Config;
-use crate::inventory::{AGE_BUCKET, Cache, Inventory, Usage, Workspace};
+use crate::inventory::{AGE_BUCKET, Cache, InstallBase, Inventory, OutputBase, Usage, Workspace};
 
 #[derive(Debug)]
 pub enum Sweep {
@@ -27,12 +27,14 @@ pub struct Pressure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     PurgeTrash(PathBuf),
+    /// Skipped if Bazel used the output base again after `base.last_used`.
     DeleteOutputBase {
-        path: PathBuf,
+        base: OutputBase,
         reason: Reason,
     },
+    /// Skipped if Bazel used the install base again after `base.last_used`.
     DeleteInstallBase {
-        path: PathBuf,
+        base: InstallBase,
         reason: Reason,
     },
     /// Evict the entries of `cache` last used before `older_than`.
@@ -74,7 +76,7 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
     for base in &inventory.output_bases {
         match &base.workspace {
             Workspace::Missing(workspace) => actions.push(Action::DeleteOutputBase {
-                path: base.path.clone(),
+                base: base.clone(),
                 reason: Reason::WorkspaceDeleted(workspace.clone()),
             }),
             _ => kept.push(base),
@@ -88,17 +90,17 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
         let idle = idle_since(install.last_used);
         if idle >= config.install_base_idle {
             actions.push(Action::DeleteInstallBase {
-                path: install.path.clone(),
+                base: install.clone(),
                 reason: Reason::Idle(idle),
             });
         }
     }
-    kept.retain(|base| {
+    kept.retain(|&base| {
         let idle = idle_since(base.last_used);
         let expired = idle >= config.output_base_idle;
         if expired {
             actions.push(Action::DeleteOutputBase {
-                path: base.path.clone(),
+                base: base.clone(),
                 reason: Reason::Idle(idle),
             });
         }
@@ -113,7 +115,7 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
         let mut freed: u64 = actions
             .iter()
             .map(|action| match action {
-                Action::DeleteOutputBase { path, .. } => usage.size(path),
+                Action::DeleteOutputBase { base, .. } => usage.size(&base.path),
                 _ => 0,
             })
             .sum();
@@ -122,7 +124,7 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
         let mut queue: Vec<(SystemTime, Candidate)> = kept
             .iter()
             .filter(|base| base.last_used < floor)
-            .map(|base| (base.last_used, Candidate::OutputBase(&base.path)))
+            .map(|base| (base.last_used, Candidate::OutputBase(base)))
             .collect();
         for cache in &inventory.caches {
             let Some(ages) = usage.ages.get(&cache.root) else {
@@ -151,10 +153,10 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
                 break;
             }
             match candidate {
-                Candidate::OutputBase(path) => {
-                    freed += usage.size(path);
+                Candidate::OutputBase(base) => {
+                    freed += usage.size(&base.path);
                     actions.push(Action::DeleteOutputBase {
-                        path: path.to_path_buf(),
+                        base: base.clone(),
                         reason: Reason::DiskPressure,
                     });
                 }
@@ -185,7 +187,7 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
 }
 
 enum Candidate<'a> {
-    OutputBase(&'a Path),
+    OutputBase(&'a OutputBase),
     /// The disk-cache entries in the age bucket that ends at `end`.
     Entries {
         root: &'a Path,
@@ -197,7 +199,7 @@ enum Candidate<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inventory::{CacheKind, InstallBase, OutputBase, bucket_start};
+    use crate::inventory::{CacheKind, bucket_start};
     use std::collections::BTreeMap;
 
     const HOUR: Duration = Duration::from_secs(3600);
@@ -229,7 +231,7 @@ mod tests {
         actions
             .iter()
             .filter_map(|action| match action {
-                Action::DeleteOutputBase { path, reason } => Some((path.to_str()?, reason)),
+                Action::DeleteOutputBase { base, reason } => Some((base.path.to_str()?, reason)),
                 _ => None,
             })
             .collect()
@@ -268,7 +270,7 @@ mod tests {
             [
                 Action::PurgeTrash("/root/.cendrillon-trash-old".into()),
                 Action::DeleteOutputBase {
-                    path: "/root/gone".into(),
+                    base: inventory.output_bases[0].clone(),
                     reason: Reason::WorkspaceDeleted("/w/gone".into()),
                 },
             ]
@@ -298,7 +300,7 @@ mod tests {
             [("/root/stale", &Reason::Idle(25 * HOUR))]
         );
         assert!(actions.contains(&Action::DeleteInstallBase {
-            path: "/root/install/old".into(),
+            base: inventory.install_bases[0].clone(),
             reason: Reason::Idle(73 * HOUR),
         }));
         assert_eq!(
