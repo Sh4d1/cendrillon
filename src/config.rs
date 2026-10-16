@@ -29,6 +29,11 @@ pub struct Config {
     /// Delete a whole Cargo target directory when nothing has been built in it for this long.
     #[serde(with = "humantime_serde")]
     pub target_idle: Duration,
+    /// Keep an older generation of a Cargo build unit this long after it was compiled when it
+    /// differs from the newest only in features or crate selection: `cargo check` next to
+    /// rust-analyzer's `--all-targets` check, `cargo test -p x`, clippy.
+    #[serde(with = "humantime_serde")]
+    pub variant_idle: Duration,
     /// Below this share of free disk space, evict the least recently used items early.
     pub pressure_free_percent: u8,
     /// Under pressure, evict until this share of the disk is free.
@@ -66,6 +71,7 @@ impl Default for Config {
             install_base_idle: 72 * HOUR,
             superseded_grace: 2 * HOUR,
             target_idle: 7 * 24 * HOUR,
+            variant_idle: 24 * HOUR,
             pressure_free_percent: 15,
             target_free_percent: 25,
             recent_use_floor: 2 * HOUR,
@@ -83,7 +89,7 @@ impl Config {
     pub fn cargo_retention(&self) -> Retention {
         Retention {
             grace: self.superseded_grace,
-            variants: self.target_idle,
+            variants: self.variant_idle,
         }
     }
 
@@ -146,6 +152,7 @@ mod tests {
         assert_eq!(config.cache_entry_idle, 72 * HOUR);
         assert_eq!(config.superseded_grace, HOUR / 2);
         assert_eq!(config.target_idle, 7 * 24 * HOUR);
+        assert_eq!(config.cargo_retention().variants, 24 * HOUR);
     }
 
     #[test]

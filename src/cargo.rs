@@ -101,9 +101,10 @@ pub struct Retention {
     /// Top-level units compiled this recently are current, with everything they depend on, so
     /// switching back to the previous branch soon after rebuilds nothing.
     pub grace: Duration,
-    /// An older generation of a top-level unit that differs from the newest only in ways the
-    /// fingerprint does not record stays current this long: `cargo clippy` and `cargo check`
-    /// builds of a workspace crate look exactly like that, and both stay in use.
+    /// An older generation of a top-level unit that differs from the newest only in features
+    /// or in what the fingerprint does not record stays current this long. Commands used side
+    /// by side build such variants: `cargo check` and rust-analyzer's `--all-targets` check
+    /// unify features differently, `cargo clippy` looks exactly like `cargo check`.
     pub variants: Duration,
 }
 
@@ -216,7 +217,6 @@ fn dead_incremental_dirs(
 #[derive(Deserialize)]
 struct FingerprintJson {
     rustc: u64,
-    features: String,
     target: u64,
     profile: u64,
     path: u64,
@@ -245,12 +245,12 @@ struct UnitKey {
 struct Node {
     dir: usize,
     key: UnitKey,
-    /// Everything the JSON records about the unit itself. With its dependencies' shapes, it
-    /// tells an out-of-date generation from a variant built differently in ways the
-    /// fingerprint does not record. A registry crate's version shows in its source path.
-    own_shape: u64,
-    /// The value dependents record for it: the role's hash file, read as little-endian.
-    fingerprint: u64,
+    /// Rustc version and flags. Generations built by another toolchain or with other flags are
+    /// out of date, not variants.
+    toolchain: u64,
+    /// The value dependents record for it: the role's hash file, read as little-endian. Cargo
+    /// empties the file when the unit failed to compile, so nothing can depend on it.
+    fingerprint: Option<u64>,
     /// The crate's name as rustc and `--extern` know it, with `_` for `-`.
     crate_name: String,
     /// The hash file is rewritten whenever the unit is compiled.
@@ -342,10 +342,9 @@ impl Graph {
         let variants_since = before(now, retention.variants);
         let mut by_fingerprint: HashMap<u64, Vec<usize>> = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
-            by_fingerprint
-                .entry(node.fingerprint)
-                .or_default()
-                .push(index);
+            if let Some(fingerprint) = node.fingerprint {
+                by_fingerprint.entry(fingerprint).or_default().push(index);
+            }
         }
         let mut referenced: HashSet<usize> = HashSet::new();
         let mut packages: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -366,17 +365,24 @@ impl Graph {
                 *best = index;
             }
         }
-        let shapes = self.shapes(&by_fingerprint);
-        let mut pending: Vec<usize> = roots
-            .iter()
-            .copied()
-            .filter(|&index| {
-                let node = &self.nodes[index];
-                let newest = newest[&node.key];
-                node.compiled >= live_since
-                    || (shapes[index] == shapes[newest] && node.compiled >= variants_since)
-            })
-            .collect();
+        let mut closures: HashMap<usize, Closure> = HashMap::new();
+        let mut pending: Vec<usize> = Vec::new();
+        for &index in &roots {
+            let node = &self.nodes[index];
+            let newest = newest[&node.key];
+            let current = node.compiled >= live_since
+                || (node.compiled >= variants_since
+                    && node.toolchain == self.nodes[newest].toolchain
+                    && is_variant(
+                        &self.closure(index, &by_fingerprint),
+                        closures
+                            .entry(newest)
+                            .or_insert_with(|| self.closure(newest, &by_fingerprint)),
+                    ));
+            if current {
+                pending.push(index);
+            }
+        }
         pending.extend(newest.into_values());
         pending.extend(uplifted.iter().flat_map(|&dir| &self.dirs[dir].nodes));
 
@@ -465,71 +471,53 @@ impl Graph {
         uplifted
     }
 
-    /// Each node's own shape combined with its dependencies' shapes, recursively.
-    fn shapes(&self, by_fingerprint: &HashMap<u64, Vec<usize>>) -> Vec<u64> {
-        fn visit(
-            graph: &Graph,
-            by_fingerprint: &HashMap<u64, Vec<usize>>,
-            index: usize,
-            memo: &mut Vec<Option<u64>>,
-            visiting: &mut Vec<bool>,
-        ) -> u64 {
-            if let Some(shape) = memo[index] {
-                return shape;
+    /// The crates a unit was built against, transitively, with the source paths of the
+    /// generations used: a registry crate's path names its version.
+    fn closure(&self, root: usize, by_fingerprint: &HashMap<u64, Vec<usize>>) -> Closure<'_> {
+        let mut crates: Closure = HashMap::new();
+        let mut seen = HashSet::from([root]);
+        let mut pending = vec![root];
+        while let Some(index) = pending.pop() {
+            for (_, _, fingerprint) in &self.nodes[index].deps {
+                for &dep in by_fingerprint.get(fingerprint).into_iter().flatten() {
+                    if seen.insert(dep) {
+                        let key = &self.nodes[dep].key;
+                        crates.entry(&key.role).or_default().insert(key.path);
+                        pending.push(dep);
+                    }
+                }
             }
-            let node = &graph.nodes[index];
-            visiting[index] = true;
-            let mut deps: Vec<(&str, u64)> = Vec::new();
-            for (_, name, fingerprint) in &node.deps {
-                // A fingerprint is unique in practice; `visiting` only guards against a
-                // corrupt one pointing back up the graph.
-                let resolved = by_fingerprint
-                    .get(fingerprint)
-                    .and_then(|found| found.iter().copied().find(|&dep| !visiting[dep]));
-                let shape = match resolved {
-                    Some(dep) => visit(graph, by_fingerprint, dep, memo, visiting),
-                    None => *fingerprint,
-                };
-                deps.push((name, shape));
-            }
-            deps.sort_unstable();
-            visiting[index] = false;
-            let mut hasher = DefaultHasher::new();
-            (node.own_shape, deps).hash(&mut hasher);
-            let shape = hasher.finish();
-            memo[index] = Some(shape);
-            shape
         }
-
-        let mut memo = vec![None; self.nodes.len()];
-        let mut visiting = vec![false; self.nodes.len()];
-        (0..self.nodes.len())
-            .map(|index| visit(self, by_fingerprint, index, &mut memo, &mut visiting))
-            .collect()
+        crates
     }
+}
+
+/// Per dependency role, the source paths a unit was built against.
+type Closure<'a> = HashMap<&'a str, HashSet<u64>>;
+
+/// Whether two generations of a unit are variants, built with other features or crate
+/// selections, rather than one being out of date: no crate appears in both at different
+/// versions. A crate in only one of them, or at an extra version, is a feature difference.
+fn is_variant(a: &Closure, b: &Closure) -> bool {
+    a.iter().all(|(role, paths)| {
+        b.get(role)
+            .is_none_or(|other| paths.is_subset(other) || other.is_subset(paths))
+    })
 }
 
 /// Reads one role of a unit. `None` when anything is missing or unexpected, so the unit is
 /// kept rather than guessed at.
 fn read_node(json: &Path, hash_file: &Path, role: &str, dir: usize) -> Option<Node> {
     let parsed: FingerprintJson = serde_json::from_slice(&fs::read(json).ok()?).ok()?;
-    let hash = decode_hex(fs::read_to_string(hash_file).ok()?.trim())?;
-    let fingerprint = u64::from_le_bytes(hash.try_into().ok()?);
+    let hash = fs::read_to_string(hash_file).ok()?;
+    let fingerprint = match hash.trim() {
+        "" => None,
+        hex => Some(u64::from_le_bytes(decode_hex(hex)?.try_into().ok()?)),
+    };
     let compiled = mtime(hash_file)?;
     let crate_name = crate_name(role);
-    let mut own_shape = DefaultHasher::new();
-    (
-        role,
-        parsed.rustc,
-        &parsed.features,
-        parsed.target,
-        parsed.profile,
-        parsed.path,
-        parsed.compile_kind,
-        parsed.config,
-        &parsed.rustflags,
-    )
-        .hash(&mut own_shape);
+    let mut toolchain = DefaultHasher::new();
+    (parsed.rustc, parsed.config, &parsed.rustflags).hash(&mut toolchain);
     Some(Node {
         dir,
         key: UnitKey {
@@ -539,7 +527,7 @@ fn read_node(json: &Path, hash_file: &Path, role: &str, dir: usize) -> Option<No
             path: parsed.path,
             compile_kind: parsed.compile_kind,
         },
-        own_shape: own_shape.finish(),
+        toolchain: toolchain.finish(),
         fingerprint,
         crate_name,
         compiled,
@@ -816,9 +804,12 @@ mod tests {
         let protected = garbage(&ws.target(), keep(DAY, DAY), SystemTime::now());
         assert_eq!(protected.unwrap().units, 0);
 
-        // After it: the first build's and the first check's app and dep are out of date,
-        // whatever `variants` says, since `dep` is built with other features.
-        let found = garbage(&ws.target(), keep(Duration::ZERO, 7 * DAY), later()).unwrap();
+        // Building with other features makes a variant, kept for as long as `variants` says.
+        let kept = garbage(&ws.target(), keep(Duration::ZERO, 7 * DAY), later()).unwrap();
+        assert_eq!(kept.units, 0, "{kept:#?}");
+
+        // After it: the first build's and the first check's app and dep go.
+        let found = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later()).unwrap();
         assert_eq!(found.units, 4, "{found:#?}");
         assert_eq!(found.incremental_dirs, 4, "{found:#?}");
         let debug = ws.target().join("debug");
@@ -848,6 +839,25 @@ mod tests {
         assert_eq!(found.units, 0, "{found:#?}");
         let found = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later());
         assert_eq!(found.unwrap().units, 2);
+    }
+
+    #[test]
+    fn other_flags_make_older_generations_out_of_date_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path());
+        let flags = [("RUSTFLAGS", "--cfg cendrillon_test")];
+        ws.cargo("build");
+        ws.cargo_with("build", &flags);
+
+        let found = garbage(&ws.target(), keep(Duration::ZERO, 7 * DAY), later()).unwrap();
+        assert_eq!(found.units, 2, "{found:#?}");
+        for path in &found.paths {
+            fs::remove_dir_all(path)
+                .or_else(|_| fs::remove_file(path))
+                .unwrap();
+        }
+        let build = ws.cargo_with("build", &flags);
+        assert!(!build.contains("Compiling"), "{build}");
     }
 
     #[test]
