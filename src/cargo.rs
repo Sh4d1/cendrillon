@@ -40,21 +40,27 @@ impl Target {
         if !is_file(&dir.join(".rustc_info.json")) {
             return None;
         }
-        let built = profiles(dir)
+        let profiles = profiles(dir);
+        if profiles.is_empty() {
+            return None;
+        }
+        // A log cendrillon cannot read hides when Cargo last used the target: assume now.
+        let logged = match ReadLog::load(dir) {
+            Ok(log) => log.latest(),
+            Err(_) => Some(SystemTime::now()),
+        };
+        let units = profiles
             .iter()
-            .flat_map(|profile| {
-                [
-                    profile.clone(),
-                    profile.join("deps"),
-                    profile.join(".fingerprint"),
-                ]
-            })
-            .filter_map(|path| mtime(&path))
-            .max()?;
-        let read = ReadLog::load(dir).latest();
+            .flat_map(|profile| real_subdirs(&profile.join(".fingerprint")))
+            .flat_map(|unit| hash_files(&unit))
+            .filter_map(|hash_file| {
+                let meta = fs::symlink_metadata(hash_file).ok()?;
+                let (accessed, modified) = (meta.accessed().ok()?, meta.modified().ok()?);
+                Some(accessed.max(modified))
+            });
         Some(Self {
             root: dir.to_path_buf(),
-            last_used: read.map_or(built, |read| read.max(built)),
+            last_used: units.chain(logged).max().unwrap_or(SystemTime::UNIX_EPOCH),
         })
     }
 }
@@ -93,8 +99,9 @@ fn is_profile(dir: &Path) -> bool {
 /// Notes which units Cargo read since the last call, and sets their hash files up to show the
 /// next read. Only access times change: Cargo goes by contents and modification times.
 pub fn record_reads(target: &Path) -> io::Result<()> {
-    let mut log = ReadLog::load(target);
+    let mut log = ReadLog::load(target)?;
     let mut present = HashSet::new();
+    let mut to_arm = Vec::new();
     for profile in profiles(target) {
         for unit in real_subdirs(&profile.join(".fingerprint")) {
             let key = ReadLog::key(target, &unit);
@@ -105,17 +112,24 @@ pub fn record_reads(target: &Path) -> io::Result<()> {
                     log.record(&key, accessed);
                 }
                 if accessed >= modified {
-                    let armed = modified
-                        .checked_sub(Duration::from_secs(1))
-                        .unwrap_or(SystemTime::UNIX_EPOCH);
-                    fs::File::open(&hash_file)?.set_times(FileTimes::new().set_accessed(armed))?;
+                    to_arm.push((hash_file, modified));
                 }
             }
             present.insert(key);
         }
     }
     log.units.retain(|key, _| present.contains(key));
-    log.save(target)
+    // Saved before any access time is reset, so a failure below loses no read.
+    log.save(target)?;
+    for (hash_file, modified) in to_arm {
+        let armed = modified
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        // A file that cannot be armed (built by root, say) only stops showing reads.
+        let _ = fs::File::open(&hash_file)
+            .and_then(|file| file.set_times(FileTimes::new().set_accessed(armed)));
+    }
+    Ok(())
 }
 
 /// The fingerprint hash file of each role of a unit: `<role>` next to `<role>.json`.
@@ -137,16 +151,22 @@ struct ReadLog {
 }
 
 impl ReadLog {
-    fn load(target: &Path) -> Self {
-        fs::read(target.join(READ_LOG))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    /// The log, empty if there is none yet. An unreadable one is an error: without it,
+    /// generations still in use would look unused.
+    fn load(target: &Path) -> io::Result<Self> {
+        match fs::read(target.join(READ_LOG)) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e),
+        }
     }
 
     fn save(&self, target: &Path) -> io::Result<()> {
+        use std::io::Write;
         let temp = target.join(format!("{READ_LOG}.tmp"));
-        fs::write(&temp, serde_json::to_vec(self)?)?;
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(&serde_json::to_vec(self)?)?;
+        file.sync_all()?;
         fs::rename(temp, target.join(READ_LOG))
     }
 
@@ -158,7 +178,9 @@ impl ReadLog {
     }
 
     fn record(&mut self, key: &str, time: SystemTime) {
+        // An access time in the future (a restored backup) would pin the unit until then.
         let secs = time
+            .min(SystemTime::now())
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
@@ -196,7 +218,7 @@ pub struct Garbage {
 pub fn garbage(target: &Path, unit_idle: Duration, now: SystemTime) -> io::Result<Garbage> {
     let recent = now.checked_sub(unit_idle).unwrap_or(SystemTime::UNIX_EPOCH);
     let profiles = profiles(target);
-    let log = ReadLog::load(target);
+    let log = ReadLog::load(target)?;
     let mut graph = Graph::default();
     for (index, profile) in profiles.iter().enumerate() {
         graph.load(index, profile, |unit| log.get(&ReadLog::key(target, unit)))?;
@@ -442,26 +464,36 @@ impl Graph {
             .extend((0..self.nodes.len()).filter(|&index| self.nodes[index].last_used >= recent));
 
         let mut live = HashSet::new();
-        let mut unresolved: Vec<(u64, &str)> = Vec::new();
-        while let Some(index) = pending.pop() {
-            if !live.insert(index) {
-                continue;
-            }
-            for (package, name, fingerprint) in &self.nodes[index].deps {
-                match by_fingerprint.get(fingerprint) {
-                    Some(deps) => pending.extend(deps),
-                    // Built against a version of this dependency that has been rebuilt since,
-                    // so the unit is dirty, and which generation its rebuild will use is
-                    // unknown: keep them all, found by package or by crate name.
-                    None => unresolved.push((*package, name)),
+        let mut unresolved: HashSet<(u64, &str)> = HashSet::new();
+        let mut handled: HashSet<(u64, &str)> = HashSet::new();
+        loop {
+            while let Some(index) = pending.pop() {
+                if !live.insert(index) {
+                    continue;
+                }
+                for (package, name, fingerprint) in &self.nodes[index].deps {
+                    match by_fingerprint.get(fingerprint) {
+                        Some(deps) => pending.extend(deps),
+                        // Built against a version of this dependency that has been rebuilt
+                        // since, so the unit is dirty, and which generation its rebuild will
+                        // use is unknown: keep them all, found by package or by crate name.
+                        None => {
+                            unresolved.insert((*package, name.as_str()));
+                        }
+                    }
                 }
             }
-        }
-        for (package, name) in unresolved {
-            live.extend(packages.get(&package).into_iter().flatten());
-            live.extend(
-                (0..self.nodes.len()).filter(|&index| self.nodes[index].crate_name == name),
-            );
+            let new: Vec<(u64, &str)> = unresolved.difference(&handled).copied().collect();
+            if new.is_empty() {
+                break;
+            }
+            for (package, name) in new {
+                handled.insert((package, name));
+                pending.extend(packages.get(&package).into_iter().flatten());
+                pending.extend(
+                    (0..self.nodes.len()).filter(|&index| self.nodes[index].crate_name == name),
+                );
+            }
         }
         live
     }
@@ -575,7 +607,10 @@ fn read_hash_file(path: &Path) -> io::Result<(String, SystemTime, SystemTime)> {
     let (modified, accessed) = (meta.modified()?, meta.accessed()?);
     let mut hash = String::new();
     file.read_to_string(&mut hash)?;
-    file.set_times(FileTimes::new().set_accessed(accessed))?;
+    // macOS only moves the access time while it is older than the modification time.
+    if accessed < modified {
+        file.set_times(FileTimes::new().set_accessed(accessed))?;
+    }
     Ok((hash, modified, accessed))
 }
 
@@ -947,7 +982,7 @@ mod tests {
         assert_eq!(read_since_armed(), 2);
         record_reads(&ws.target()).unwrap();
         assert_eq!(read_since_armed(), 0);
-        assert_eq!(ReadLog::load(&ws.target()).units.len(), 2);
+        assert_eq!(ReadLog::load(&ws.target()).unwrap().units.len(), 2);
         let after: Vec<_> = ws
             .units()
             .iter()
@@ -1018,6 +1053,18 @@ mod tests {
             }
         }
         assert!(garbage(&ws.target(), Duration::ZERO, later()).is_err());
+    }
+
+    #[test]
+    fn a_corrupt_read_log_stops_trimming_and_keeps_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path());
+        ws.cargo("build");
+        fs::write(ws.target().join(READ_LOG), "{").unwrap();
+        assert!(record_reads(&ws.target()).is_err());
+        assert!(garbage(&ws.target(), Duration::ZERO, later()).is_err());
+        let target = Target::classify(&ws.target()).unwrap();
+        assert!(target.last_used.elapsed().unwrap_or_default() < Duration::from_secs(60));
     }
 
     #[test]
