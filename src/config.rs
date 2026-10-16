@@ -85,10 +85,15 @@ impl Config {
                 && config.target_free_percent < 100,
             "need pressure_free_percent <= target_free_percent < 100"
         );
-        ensure!(
-            !config.tick_interval.is_zero(),
-            "tick_interval must be positive"
-        );
+        let intervals = [
+            ("tick_interval", config.tick_interval),
+            ("sweep_interval", config.sweep_interval),
+            ("pressure_cooldown", config.pressure_cooldown),
+            ("home_scan_interval", config.home_scan_interval),
+        ];
+        for (name, interval) in intervals {
+            ensure!(!interval.is_zero(), "{name} must be positive");
+        }
         Ok(config)
     }
 }
@@ -124,6 +129,7 @@ mod tests {
     fn rejects_unknown_keys_and_inverted_thresholds() {
         assert!(Config::parse("output_base_ttl = \"1h\"").is_err());
         assert!(Config::parse("pressure_free_percent = 30").is_err());
+        assert!(Config::parse("pressure_cooldown = \"0s\"").is_err());
     }
 
     #[test]
