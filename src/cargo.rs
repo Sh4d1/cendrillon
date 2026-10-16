@@ -57,10 +57,15 @@ impl Target {
                 let meta = fs::symlink_metadata(hash_file).ok()?;
                 let (accessed, modified) = (meta.accessed().ok()?, meta.modified().ok()?);
                 Some(accessed.max(modified))
-            });
+            })
+            .chain(logged)
+            .max();
+        // A target without units only has its directories to go by.
+        let last_used =
+            units.or_else(|| profiles.iter().filter_map(|profile| mtime(profile)).max());
         Some(Self {
             root: dir.to_path_buf(),
-            last_used: units.chain(logged).max().unwrap_or(SystemTime::UNIX_EPOCH),
+            last_used: last_used?,
         })
     }
 }

@@ -232,7 +232,9 @@ impl Executor<'_> {
         // changes the profile's mtime: the target is then kept until the next pass.
         cargo::record_reads(&target.root)
             .with_context(|| format!("recording reads in {}", target.root.display()))?;
-        if Target::classify(&target.root).map(|found| found.last_used) != Some(target.last_used) {
+        // The read log keeps whole seconds, so only a later second means Cargo came back.
+        let planned = target.last_used + Duration::from_secs(1);
+        if Target::classify(&target.root).is_none_or(|found| found.last_used > planned) {
             return Ok(Outcome::Skipped(
                 "Cargo used it while cendrillon was planning",
             ));
