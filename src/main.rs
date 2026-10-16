@@ -1,3 +1,6 @@
-fn main() {
-    println!("Hello, world!");
-}
+#![allow(dead_code)]
+
+mod config;
+mod sys;
+
+fn main() {}
