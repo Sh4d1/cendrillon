@@ -3,12 +3,12 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 
 use crate::env::Env;
 use crate::inventory::{Inventory, Item, OutputBase, Workspace, classify};
@@ -142,38 +142,50 @@ fn search_root(item: &Item) -> Option<PathBuf> {
     }
 }
 
-/// Classifies directories under `root`, not descending into what it recognizes.
+/// Classifies directories under `root`, not descending into what it recognizes, nor into
+/// other volumes.
+///
+/// A skipped directory is never opened, not even listed: reading a protected folder such as
+/// `~/Documents` is what makes macOS ask the user for permission. Walkers like `walkdir`
+/// list a directory before letting the caller skip it, hence this hand-written recursion.
 fn walk(root: &Path, max_depth: usize, home: &Path) -> Vec<Item> {
     let Ok(root) = fs::canonicalize(root) else {
         return Vec::new();
     };
+    let Ok(device) = fs::metadata(&root).map(|meta| meta.dev()) else {
+        return Vec::new();
+    };
+    let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let skipped_home_dirs: HashSet<PathBuf> = SKIPPED_HOME_DIRS
         .iter()
         .map(|name| home.join(name))
         .collect();
     let mut items = Vec::new();
-    let mut entries = WalkDir::new(&root)
-        .max_depth(max_depth)
-        .same_file_system(true)
-        .into_iter();
-    while let Some(entry) = entries.next() {
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        let skipped = path != root
-            && (skipped_home_dirs.contains(path)
-                || path
-                    .file_name()
-                    .is_some_and(|name| SKIPPED_NAMES.iter().any(|skip| name == *skip)));
-        if skipped {
-            entries.skip_current_dir();
-            continue;
-        }
-        if let Some(item) = classify(path) {
+    let mut pending = vec![(root, 0)];
+    while let Some((dir, depth)) = pending.pop() {
+        if let Some(item) = classify(&dir) {
             items.push(item);
-            entries.skip_current_dir();
+            continue;
+        }
+        if depth == max_depth {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            // From the directory listing itself: no symlink is followed, nothing is opened.
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            if SKIPPED_NAMES.iter().any(|skip| name == *skip) || skipped_home_dirs.contains(&path) {
+                continue;
+            }
+            if entry.metadata().is_ok_and(|meta| meta.dev() == device) {
+                pending.push((path, depth + 1));
+            }
         }
     }
     items
@@ -353,6 +365,24 @@ mod tests {
         let inventory = discover(&env, &[], &state);
         assert_eq!(inventory.output_bases.len(), 1);
         assert_eq!(inventory.caches.len(), 1);
+    }
+
+    #[test]
+    fn home_scan_follows_no_symlink_and_survives_unreadable_skipped_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let outside = tempfile::tempdir().unwrap();
+        disk_cache(&outside.path().join("disk"), &[]);
+        std::os::unix::fs::symlink(outside.path(), env.home.join("link")).unwrap();
+        let documents = env.home.join("Documents");
+        disk_cache(&documents.join("cache"), &[]);
+        let mode = |m| std::os::unix::fs::PermissionsExt::from_mode(m);
+        fs::set_permissions(&documents, mode(0o000)).unwrap();
+        disk_cache(&env.home.join("src/a/b/c/disk"), &[]);
+
+        let roots = scan_home(&env);
+        fs::set_permissions(&documents, mode(0o755)).unwrap();
+        assert_eq!(roots, BTreeSet::from([env.home.join("src/a/b/c/disk")]));
     }
 
     #[test]
