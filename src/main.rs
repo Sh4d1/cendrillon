@@ -4,6 +4,7 @@ mod discovery;
 mod env;
 mod executor;
 mod inventory;
+mod launchd;
 mod planner;
 mod sys;
 
@@ -48,6 +49,10 @@ enum Command {
     Scan,
     /// Clean continuously in the foreground; this is what launchd runs.
     Daemon,
+    /// Start the daemon now and at every login, as a launchd agent.
+    Install,
+    /// Stop the daemon and remove the launchd agent.
+    Uninstall,
 }
 
 fn main() -> Result<()> {
@@ -85,6 +90,8 @@ fn main() -> Result<()> {
         }
         Command::Scan => daemon::scan_home(&env, &mut State::load(&env.state_file())),
         Command::Daemon => daemon::run(&env, &config),
+        Command::Install => launchd::install(&env),
+        Command::Uninstall => launchd::uninstall(&env),
     }
 }
 
