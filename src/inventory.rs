@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::cargo::{self, Target};
+use crate::cargo::{self, Retention, Target};
 use crate::sys;
 
 /// Name prefix of a directory renamed for deletion, finished on a later pass if interrupted.
@@ -261,9 +261,8 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Walks the given items. Slow on large caches: run it only when sizes matter. Cargo units
-    /// compiled at or after `cargo_live_since` count as current.
-    pub fn measure(items: impl IntoIterator<Item = Item>, cargo_live_since: SystemTime) -> Self {
+    /// Walks the given items. Slow on large caches: run it only when sizes matter.
+    pub fn measure(items: impl IntoIterator<Item = Item>, cargo: Retention) -> Self {
         let mut usage = Usage::default();
         for item in items {
             let path = item.path().to_path_buf();
@@ -275,7 +274,7 @@ impl Usage {
                     size
                 }
                 Item::CargoTarget(target) => {
-                    if let Ok(garbage) = cargo::garbage(&target.root, cargo_live_since) {
+                    if let Ok(garbage) = cargo::garbage(&target.root, cargo, SystemTime::now()) {
                         let bytes = garbage.paths.iter().map(|path| sys::unshared_size(path));
                         usage.garbage.insert(path.clone(), bytes.sum());
                     }
@@ -559,7 +558,10 @@ mod tests {
             ],
         );
         let inventory: Inventory = classify(&cache).into_iter().collect();
-        let usage = Usage::measure(inventory.items(), SystemTime::now());
+        let usage = Usage::measure(
+            inventory.items(),
+            crate::config::Config::default().cargo_retention(),
+        );
         let ages = &usage.ages[&cache];
         assert_eq!(ages.len(), 2);
         assert_eq!(ages[&bucket_start(old)], 2 * ages[&bucket_start(now)]);

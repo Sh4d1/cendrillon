@@ -25,9 +25,10 @@ const PATH_FLAGS: [&str; 5] = [
     "repository_cache",
 ];
 
-/// Directories never walked: they are huge and hold no cache (`.git`, `node_modules`), or
-/// reading them makes macOS ask the user for permission.
-const SKIPPED_NAMES: [&str; 3] = [".git", "node_modules", ".Trash"];
+/// Directories never walked: they are huge and hold no cache (`.git`, `node_modules`), belong
+/// to a tool that manages them (`.rustup` toolchains), or reading them makes macOS ask the
+/// user for permission.
+const SKIPPED_NAMES: [&str; 4] = [".git", "node_modules", ".Trash", ".rustup"];
 const SKIPPED_HOME_DIRS: [&str; 8] = [
     "Desktop",
     "Documents",

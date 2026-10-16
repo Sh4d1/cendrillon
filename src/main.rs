@@ -78,7 +78,7 @@ fn main() -> Result<()> {
                 executor: Executor {
                     dry_run: dry_run || config.dry_run,
                     stop: &stop,
-                    superseded_grace: config.superseded_grace,
+                    cargo: config.cargo_retention(),
                 },
             };
             let freed = cleaner.full_pass(&State::load(&env.state_file()))?;
@@ -99,10 +99,7 @@ fn main() -> Result<()> {
 
 fn status(env: &Env, config: &Config) -> Result<()> {
     let inventory = discovery::discover(env, &config.extra_roots, &State::load(&env.state_file()));
-    let usage = Usage::measure(
-        inventory.items(),
-        config.cargo_live_since(SystemTime::now()),
-    );
+    let usage = Usage::measure(inventory.items(), config.cargo_retention());
     let mut rows: Vec<(u64, Item)> = inventory
         .items()
         .map(|item| (usage.size(item.path()), item))

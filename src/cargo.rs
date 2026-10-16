@@ -11,9 +11,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
@@ -84,18 +85,30 @@ pub struct Garbage {
     pub incremental_dirs: usize,
 }
 
-/// Finds the garbage in `target`. Top-level units compiled at or after `live_since` count as
-/// current too, so switching back to the previous branch within that window rebuilds nothing,
-/// and nothing compiled since then is garbage.
+/// How long superseded build units are kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    /// Top-level units compiled this recently are current, with everything they depend on, so
+    /// switching back to the previous branch soon after rebuilds nothing.
+    pub grace: Duration,
+    /// An older generation of a top-level unit that differs from the newest only in ways the
+    /// fingerprint does not show stays current this long. `cargo clippy` and `cargo check`
+    /// builds of a workspace crate, or `-p` and `--workspace` builds unifying features
+    /// differently, look exactly like that, and both stay in use.
+    pub variants: Duration,
+}
+
+/// Finds the garbage in `target`.
 ///
 /// Reads only the fingerprint JSON and hash files, and lists directories; writes nothing.
-pub fn garbage(target: &Path, live_since: SystemTime) -> io::Result<Garbage> {
+pub fn garbage(target: &Path, retention: Retention, now: SystemTime) -> io::Result<Garbage> {
+    let live_since = before(now, retention.grace);
     let profiles = profiles(target);
     let mut graph = Graph::default();
     for (index, profile) in profiles.iter().enumerate() {
         graph.load(index, profile)?;
     }
-    let live = graph.live(live_since);
+    let live = graph.live(retention, now);
 
     let mut garbage = Garbage::default();
     for (index, profile) in profiles.iter().enumerate() {
@@ -178,11 +191,17 @@ fn dead_incremental_dirs(
 /// The parts of `<role>.json` that identify a unit and its dependencies.
 #[derive(Deserialize)]
 struct FingerprintJson {
+    rustc: u64,
+    features: String,
     target: u64,
     profile: u64,
     path: u64,
     compile_kind: u64,
-    /// `[package id hash, extern crate name, public, fingerprint]`.
+    #[serde(default)]
+    config: u64,
+    #[serde(default)]
+    rustflags: Vec<String>,
+    /// `[package hash, extern crate name, public, fingerprint]`.
     deps: Vec<(u64, String, bool, u64)>,
 }
 
@@ -202,6 +221,10 @@ struct UnitKey {
 struct Node {
     dir: usize,
     key: UnitKey,
+    /// Everything the JSON records about the unit itself. With its dependencies' shapes, it
+    /// tells an out-of-date generation from a variant built differently in ways the
+    /// fingerprint does not record. A registry crate's version shows in its source path.
+    own_shape: u64,
     /// The value dependents record for it: the role's hash file, read as little-endian.
     fingerprint: u64,
     crate_name: String,
@@ -281,9 +304,11 @@ impl Graph {
         Ok(())
     }
 
-    /// Nodes in use: the newest generation of every top-level unit, every top-level unit
-    /// compiled since `live_since`, and everything they depend on.
-    fn live(&self, live_since: SystemTime) -> HashSet<usize> {
+    /// Nodes in use: the newest generation of every top-level unit, the top-level units
+    /// `retention` keeps, and everything they depend on.
+    fn live(&self, retention: Retention, now: SystemTime) -> HashSet<usize> {
+        let live_since = before(now, retention.grace);
+        let variants_since = before(now, retention.variants);
         let mut by_fingerprint: HashMap<u64, Vec<usize>> = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
             by_fingerprint
@@ -299,21 +324,28 @@ impl Graph {
             .flatten()
             .copied()
             .collect();
+        let roots: Vec<usize> = (0..self.nodes.len())
+            .filter(|index| !referenced.contains(index))
+            .collect();
 
         let mut newest: HashMap<&UnitKey, usize> = HashMap::new();
-        let mut pending: Vec<usize> = Vec::new();
-        for (index, node) in self.nodes.iter().enumerate() {
-            if referenced.contains(&index) {
-                continue;
-            }
-            if node.compiled >= live_since {
-                pending.push(index);
-            }
-            let best = newest.entry(&node.key).or_insert(index);
-            if self.nodes[*best].compiled < node.compiled {
+        for &index in &roots {
+            let best = newest.entry(&self.nodes[index].key).or_insert(index);
+            if self.nodes[*best].compiled < self.nodes[index].compiled {
                 *best = index;
             }
         }
+        let shapes = self.shapes(&by_fingerprint);
+        let mut pending: Vec<usize> = roots
+            .iter()
+            .copied()
+            .filter(|&index| {
+                let node = &self.nodes[index];
+                let newest = newest[&node.key];
+                node.compiled >= live_since
+                    || (shapes[index] == shapes[newest] && node.compiled >= variants_since)
+            })
+            .collect();
         pending.extend(newest.into_values());
 
         let mut live = HashSet::new();
@@ -353,6 +385,49 @@ impl Graph {
         }
         counts
     }
+
+    /// Each node's own shape combined with its dependencies' shapes, recursively.
+    fn shapes(&self, by_fingerprint: &HashMap<u64, Vec<usize>>) -> Vec<u64> {
+        fn visit(
+            graph: &Graph,
+            by_fingerprint: &HashMap<u64, Vec<usize>>,
+            index: usize,
+            memo: &mut Vec<Option<u64>>,
+            visiting: &mut Vec<bool>,
+        ) -> u64 {
+            if let Some(shape) = memo[index] {
+                return shape;
+            }
+            let node = &graph.nodes[index];
+            visiting[index] = true;
+            let mut deps: Vec<(&str, u64)> = Vec::new();
+            for (name, fingerprint) in &node.deps {
+                // A fingerprint is unique in practice; `visiting` only guards against a
+                // corrupt one pointing back up the graph.
+                let resolved = by_fingerprint
+                    .get(fingerprint)
+                    .and_then(|found| found.iter().copied().find(|&dep| !visiting[dep]));
+                let shape = match resolved {
+                    Some(dep) => visit(graph, by_fingerprint, dep, memo, visiting),
+                    None => *fingerprint,
+                };
+                deps.push((name, shape));
+            }
+            deps.sort_unstable();
+            visiting[index] = false;
+            let mut hasher = DefaultHasher::new();
+            (node.own_shape, deps).hash(&mut hasher);
+            let shape = hasher.finish();
+            memo[index] = Some(shape);
+            shape
+        }
+
+        let mut memo = vec![None; self.nodes.len()];
+        let mut visiting = vec![false; self.nodes.len()];
+        (0..self.nodes.len())
+            .map(|index| visit(self, by_fingerprint, index, &mut memo, &mut visiting))
+            .collect()
+    }
 }
 
 /// Reads one role of a unit. `None` when anything is missing or unexpected, so the unit is
@@ -368,6 +443,19 @@ fn read_node(json: &Path, hash_file: &Path, role: &str, dir: usize) -> Option<No
     } else {
         role.rsplit_once('-')?.1
     };
+    let mut own_shape = DefaultHasher::new();
+    (
+        role,
+        parsed.rustc,
+        &parsed.features,
+        parsed.target,
+        parsed.profile,
+        parsed.path,
+        parsed.compile_kind,
+        parsed.config,
+        &parsed.rustflags,
+    )
+        .hash(&mut own_shape);
     Some(Node {
         dir,
         key: UnitKey {
@@ -377,6 +465,7 @@ fn read_node(json: &Path, hash_file: &Path, role: &str, dir: usize) -> Option<No
             path: parsed.path,
             compile_kind: parsed.compile_kind,
         },
+        own_shape: own_shape.finish(),
         fingerprint,
         crate_name: crate_name.to_owned(),
         compiled,
@@ -387,6 +476,10 @@ fn read_node(json: &Path, hash_file: &Path, role: &str, dir: usize) -> Option<No
             .collect(),
         compiles: !role.starts_with("run-"),
     })
+}
+
+fn before(now: SystemTime, duration: Duration) -> SystemTime {
+    now.checked_sub(duration).unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -487,7 +580,7 @@ pub mod fixtures {
             self.root.join("target")
         }
 
-        /// Enables `dep/extra` from `app`, which makes new generations of both.
+        /// Enables `dep/extra` from `app`, which makes new generations of both crates.
         pub fn enable_extra(&self) {
             let manifest = self.root.join("app/Cargo.toml");
             let text = fs::read_to_string(&manifest).unwrap().replace(
@@ -499,12 +592,18 @@ pub mod fixtures {
 
         /// Runs a Cargo command and returns its `-v` output, which says what was Fresh.
         pub fn cargo(&self, command: &str) -> String {
+            self.cargo_with(command, &[])
+        }
+
+        pub fn cargo_with(&self, command: &str, env: &[(&str, &str)]) -> String {
             let output = Command::new("cargo")
                 .args([command, "--offline", "-v"])
                 .current_dir(&self.root)
                 .env_remove("CARGO_TARGET_DIR")
                 .env_remove("RUSTFLAGS")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
                 .env("CARGO_INCREMENTAL", "1")
+                .envs(env.iter().copied())
                 .output()
                 .unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -518,10 +617,16 @@ pub mod fixtures {
 mod tests {
     use super::fixtures::Workspace;
     use super::*;
-    use std::time::Duration;
 
-    fn far_past() -> SystemTime {
-        SystemTime::UNIX_EPOCH
+    const DAY: Duration = Duration::from_secs(24 * 3600);
+
+    fn keep(grace: Duration, variants: Duration) -> Retention {
+        Retention { grace, variants }
+    }
+
+    /// Just after everything built so far.
+    fn later() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(1)
     }
 
     fn fingerprint_dirs(target: &Path, package: &str) -> usize {
@@ -555,36 +660,30 @@ mod tests {
     }
 
     #[test]
-    fn superseded_generations_are_garbage_and_current_ones_survive_check_and_build() {
+    fn outdated_generations_are_garbage_and_the_next_builds_are_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path());
         ws.cargo("build");
         ws.cargo("check");
-        assert_eq!(
-            garbage(&ws.target(), far_past()).unwrap(),
-            Garbage::default()
-        );
+        let none = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later());
+        assert_eq!(none.unwrap(), Garbage::default());
 
         ws.enable_extra();
         ws.cargo("build");
         ws.cargo("check");
         assert_eq!(fingerprint_dirs(&ws.target(), "dep"), 4);
 
-        // Everything was compiled just now, so a window reaching back protects it all.
-        let protected = garbage(&ws.target(), SystemTime::now() - Duration::from_secs(3600));
+        // Everything was compiled just now, so the grace period protects it all.
+        let protected = garbage(&ws.target(), keep(DAY, DAY), SystemTime::now());
         assert_eq!(protected.unwrap().units, 0);
 
-        // Without the window: the first build's and the first check's app and dep are
-        // superseded, along with their incremental directories.
-        let found = garbage(&ws.target(), SystemTime::now() + Duration::from_secs(1)).unwrap();
+        // After it: the first build's and the first check's app and dep are out of date,
+        // whatever `variants` says, since `dep` is built with other features.
+        let found = garbage(&ws.target(), keep(Duration::ZERO, 7 * DAY), later()).unwrap();
         assert_eq!(found.units, 4, "{found:#?}");
         assert_eq!(found.incremental_dirs, 4, "{found:#?}");
-        assert!(
-            found
-                .paths
-                .iter()
-                .all(|path| path.starts_with(ws.target().join("debug")))
-        );
+        let debug = ws.target().join("debug");
+        assert!(found.paths.iter().all(|path| path.starts_with(&debug)));
         for path in &found.paths {
             fs::remove_dir_all(path)
                 .or_else(|_| fs::remove_file(path))
@@ -594,10 +693,22 @@ mod tests {
         let build = ws.cargo("build");
         assert!(!build.contains("Compiling"), "{build}");
         let check = ws.cargo("check");
-        assert!(
-            !check.contains("Checking") && !check.contains("Compiling"),
-            "{check}"
-        );
+        assert!(!check.contains("Checking"), "{check}");
+    }
+
+    #[test]
+    fn variants_that_look_the_same_stay_current_for_a_while() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path());
+        ws.cargo("check");
+        // As `cargo clippy` does: same fingerprint, other unit directories.
+        ws.cargo_with("check", &[("RUSTC_WORKSPACE_WRAPPER", "/usr/bin/env")]);
+        assert_eq!(fingerprint_dirs(&ws.target(), "dep"), 2);
+
+        let found = garbage(&ws.target(), keep(Duration::ZERO, 7 * DAY), later()).unwrap();
+        assert_eq!(found.units, 0, "{found:#?}");
+        let found = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later());
+        assert_eq!(found.unwrap().units, 2);
     }
 
     #[test]
@@ -614,8 +725,8 @@ mod tests {
                 }
             }
         }
-        let found = garbage(&ws.target(), SystemTime::now() + Duration::from_secs(1)).unwrap();
-        assert_eq!(found.units, 0);
+        let found = garbage(&ws.target(), keep(Duration::ZERO, Duration::ZERO), later());
+        assert_eq!(found.unwrap().units, 0);
     }
 
     #[test]

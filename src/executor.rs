@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
-use crate::cargo::{self, Target};
+use crate::cargo::{self, Retention, Target};
 use crate::inventory::{
     self, Cache, CacheKind, InstallBase, OutputBase, TRASH_PREFIX, disk_cache_entries,
     repository_cache_entries,
@@ -24,8 +24,8 @@ pub struct Executor<'a> {
     pub dry_run: bool,
     /// Set by a signal handler; checked between deletions.
     pub stop: &'a AtomicBool,
-    /// Cargo units compiled this recently are never trimmed.
-    pub superseded_grace: Duration,
+    /// How long superseded Cargo build units are kept.
+    pub cargo: Retention,
 }
 
 enum Outcome {
@@ -181,11 +181,8 @@ impl Executor<'_> {
         for leftover in trash_in(&target.root) {
             freed += self.remove(&leftover)?;
         }
-        let live_since = SystemTime::now()
-            .checked_sub(self.superseded_grace)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
         if self.dry_run {
-            let garbage = cargo::garbage(&target.root, live_since)?;
+            let garbage = cargo::garbage(&target.root, self.cargo, SystemTime::now())?;
             let bytes: u64 = garbage
                 .paths
                 .iter()
@@ -196,7 +193,7 @@ impl Executor<'_> {
         let Some(locks) = lock_profiles(&target.root)? else {
             return Ok(Outcome::Skipped("a Cargo build is running"));
         };
-        let garbage = cargo::garbage(&target.root, live_since)?;
+        let garbage = cargo::garbage(&target.root, self.cargo, SystemTime::now())?;
         if garbage.paths.is_empty() {
             return Ok(Outcome::Freed(freed));
         }
@@ -371,7 +368,10 @@ mod tests {
         Executor {
             dry_run,
             stop: &RUNNING,
-            superseded_grace: Duration::ZERO,
+            cargo: Retention {
+                grace: Duration::ZERO,
+                variants: Duration::ZERO,
+            },
         }
     }
 

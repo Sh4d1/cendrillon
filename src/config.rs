@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
+
+use crate::cargo::Retention;
 
 /// User settings, read from `~/.config/cendrillon/config.toml`. Every field is optional.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -78,10 +80,11 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Cargo units compiled at or after this time count as current.
-    pub fn cargo_live_since(&self, now: SystemTime) -> SystemTime {
-        now.checked_sub(self.superseded_grace)
-            .unwrap_or(SystemTime::UNIX_EPOCH)
+    pub fn cargo_retention(&self) -> Retention {
+        Retention {
+            grace: self.superseded_grace,
+            variants: self.target_idle,
+        }
     }
 
     /// Loads the config at `path`, or the defaults when the file does not exist.

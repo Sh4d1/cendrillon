@@ -83,7 +83,7 @@ impl Cleaner<'_> {
         });
         Ok(Pressure {
             bytes_to_free,
-            usage: Usage::measure(on_disk, self.config.cargo_live_since(SystemTime::now())),
+            usage: Usage::measure(on_disk, self.config.cargo_retention()),
         })
     }
 }
@@ -114,7 +114,7 @@ pub fn run(env: &Env, config: &Config) -> Result<()> {
         executor: Executor {
             dry_run: config.dry_run,
             stop: &stop,
-            superseded_grace: config.superseded_grace,
+            cargo: config.cargo_retention(),
         },
     };
     let mut state = State::load(&env.state_file());
