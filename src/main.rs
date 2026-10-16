@@ -1,3 +1,4 @@
+mod cargo;
 mod config;
 mod daemon;
 mod discovery;
