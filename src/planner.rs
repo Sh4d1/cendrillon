@@ -21,6 +21,8 @@ pub enum Sweep {
 #[derive(Debug)]
 pub struct Pressure {
     pub bytes_to_free: u64,
+    /// Measurements of the items on the full disk. Only these are evicted for pressure: deleting
+    /// anything elsewhere would not help.
     pub usage: Usage,
 }
 
@@ -107,11 +109,11 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
         !expired
     });
 
-    let expiry = now - config.cache_entry_idle;
+    let expiry = before(now, config.cache_entry_idle);
     let mut cutoffs: HashMap<&Path, SystemTime> = HashMap::new();
     if let Some(pressure) = pressure {
         let usage = &pressure.usage;
-        let floor = now - config.recent_use_floor;
+        let floor = before(now, config.recent_use_floor);
         let mut freed: u64 = actions
             .iter()
             .map(|action| match action {
@@ -123,7 +125,7 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
         // Every candidate, keyed by the time it was last used.
         let mut queue: Vec<(SystemTime, Candidate)> = kept
             .iter()
-            .filter(|base| base.last_used < floor)
+            .filter(|base| base.last_used < floor && usage.sizes.contains_key(&base.path))
             .map(|base| (base.last_used, Candidate::OutputBase(base)))
             .collect();
         for cache in &inventory.caches {
@@ -184,6 +186,10 @@ pub fn plan(inventory: &Inventory, now: SystemTime, config: &Config, sweep: Swee
         actions.push(action);
     }
     actions
+}
+
+fn before(now: SystemTime, duration: Duration) -> SystemTime {
+    now.checked_sub(duration).unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 enum Candidate<'a> {
@@ -364,6 +370,31 @@ mod tests {
             eviction(&actions),
             (now() - 8 * HOUR + AGE_BUCKET, &Reason::DiskPressure)
         );
+    }
+
+    #[test]
+    fn pressure_skips_items_on_other_disks() {
+        let inventory = Inventory {
+            output_bases: vec![base("external", present(), 50 * HOUR)],
+            ..Inventory::default()
+        };
+        let config = Config {
+            output_base_idle: 100 * HOUR,
+            ..Config::default()
+        };
+        let pressure = Pressure {
+            bytes_to_free: 1000,
+            usage: Usage::default(),
+        };
+        let actions = plan(
+            &inventory,
+            now(),
+            &config,
+            Sweep::Full {
+                pressure: Some(pressure),
+            },
+        );
+        assert!(deleted_bases(&actions).is_empty());
     }
 
     #[test]

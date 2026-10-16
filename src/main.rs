@@ -79,7 +79,7 @@ fn main() -> Result<()> {
                     stop: &stop,
                 },
             };
-            let freed = cleaner.pass(&State::load(&env.state_file()), true)?;
+            let freed = cleaner.full_pass(&State::load(&env.state_file()))?;
             let verb = if cleaner.executor.dry_run {
                 "Would free"
             } else {
@@ -97,7 +97,7 @@ fn main() -> Result<()> {
 
 fn status(env: &Env, config: &Config) -> Result<()> {
     let inventory = discovery::discover(env, &config.extra_roots, &State::load(&env.state_file()));
-    let usage = Usage::measure(&inventory);
+    let usage = Usage::measure(inventory.items());
     let mut rows: Vec<(u64, Item)> = inventory
         .items()
         .map(|item| (usage.size(item.path()), item))
@@ -136,7 +136,6 @@ fn describe(item: &Item) -> (&'static str, Option<SystemTime>, Option<String>) {
                 Workspace::Unreachable(path) => {
                     format!("workspace unreachable: {}", path.display())
                 }
-                Workspace::Unrecorded => "workspace unknown".into(),
             };
             let server = sys::bazel_server(&base.path)
                 .map(|pid| format!(", server pid {pid}"))
