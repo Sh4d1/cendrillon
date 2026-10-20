@@ -1,16 +1,19 @@
-//! Finding Bazel caches: the default locations, paths named in bazelrc files, and a walk of
-//! the home directory for the rest.
+//! Finding Bazel caches and Cargo targets: the default locations, paths named in bazelrc files
+//! and in Bazel's own records, and the home directory, walked once and then followed through
+//! its change journal.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::env::Env;
+use crate::fsevents;
 use crate::inventory::{Inventory, Item, OutputBase, TRASH_PREFIX, Workspace, classify};
 
 /// Deep enough to reach `<root>/<output_user_root>/install/<md5>`.
@@ -40,12 +43,27 @@ const SKIPPED_HOME_DIRS: [&str; 8] = [
     "Public",
 ];
 
-/// What the home walk found, kept between runs.
+/// After this long without a replay, the journal may have dropped part of the history since:
+/// walk the home directory again instead.
+const JOURNAL_MAX_GAP: Duration = Duration::from_secs(7 * 24 * 3600);
+const REPLAY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Where caches were found, kept between runs.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
-    pub last_home_scan: Option<SystemTime>,
+    /// How far the home directory's change journal was read; `None` until the first walk.
+    pub journal: Option<JournalPosition>,
     /// Directories to search on every pass, besides the defaults.
     pub roots: BTreeSet<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalPosition {
+    /// The journal of the home volume. macOS starts a new one when it resets it.
+    pub volume: String,
+    /// The last event read.
+    pub event: u64,
+    pub read_at: SystemTime,
 }
 
 impl State {
@@ -119,6 +137,35 @@ pub fn discover(env: &Env, extra_roots: &[PathBuf], state: &State) -> Inventory 
     items.into_iter().collect()
 }
 
+/// How `refresh` searches the home directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeSearch {
+    Skip,
+    /// Replay what changed since last time. Walk instead the first time, or when the journal
+    /// lost track.
+    Follow,
+    /// Walk it all.
+    Walk,
+}
+
+/// Learns where caches and targets are, into `state.roots`: from what Bazel recorded, and
+/// from the home directory as `home` says. Forgets roots that are gone.
+pub fn refresh(env: &Env, extra_roots: &[PathBuf], state: &mut State, home: HomeSearch) {
+    let inventory = discover(env, extra_roots, state);
+    state
+        .roots
+        .extend(bazel_records(env, &inventory.output_bases));
+    match home {
+        HomeSearch::Skip => {}
+        HomeSearch::Follow => follow_home(env, state),
+        HomeSearch::Walk => walk_home(env, state),
+    }
+    // `discover` finds the trash of a root deleted midway through the root.
+    state
+        .roots
+        .retain(|root| fs::symlink_metadata(root).is_ok() || !trash_beside(root).is_empty());
+}
+
 fn is_skipped(path: &Path) -> bool {
     path.components()
         .any(|part| SKIPPED_NAMES.iter().any(|skip| part.as_os_str() == *skip))
@@ -152,13 +199,147 @@ fn default_roots(env: &Env) -> impl Iterator<Item = PathBuf> {
     .into_iter()
 }
 
-/// Walks the home directory for Bazel caches, returning the directories to search from now
-/// on. Skips the folders macOS protects, so no Full Disk Access is needed.
-pub fn scan_home(env: &Env) -> BTreeSet<PathBuf> {
-    let caches = env.home.join("Library/Caches");
-    [env.home.as_path(), caches.as_path()]
-        .into_iter()
-        .flat_map(|root| walk(root, usize::MAX, &env.home))
+/// Walks the home directory and starts following its journal from before the walk.
+fn walk_home(env: &Env, state: &mut State) {
+    let started = Instant::now();
+    let volume = fsevents::volume(&env.home);
+    let event = fsevents::current_event();
+    let found = walk_roots(&home_dirs(&env.home), &env.home);
+    tracing::info!(
+        "walked the home directory in {:.0?}: {} cache locations",
+        started.elapsed(),
+        found.len()
+    );
+    state.roots.extend(found);
+    state.journal = volume.map(|volume| JournalPosition {
+        volume,
+        event,
+        read_at: SystemTime::now(),
+    });
+}
+
+/// Learns from what changed in the home directory since the last walk or replay.
+fn follow_home(env: &Env, state: &mut State) {
+    let Some(volume) = fsevents::volume(&env.home) else {
+        tracing::warn!("the home volume keeps no change journal; not searching it");
+        return;
+    };
+    let position = state.journal.as_ref().filter(|position| {
+        position.volume == volume
+            && position
+                .read_at
+                .elapsed()
+                .is_ok_and(|gap| gap < JOURNAL_MAX_GAP)
+    });
+    let Some(position) = position else {
+        return walk_home(env, state);
+    };
+    let sealed = sealed_roots(env, state);
+    let replayed = fsevents::replay(
+        &watched_dirs(&env.home),
+        &sealed,
+        position.event,
+        REPLAY_TIMEOUT,
+    );
+    let changes = match replayed {
+        Ok(changes) if changes.ids_wrapped => return walk_home(env, state),
+        Ok(changes) => changes,
+        Err(e) => {
+            tracing::warn!("replaying changes in the home directory: {e:#}");
+            return;
+        }
+    };
+    let changed = changes
+        .dirs
+        .iter()
+        .filter(|dir| !sealed.iter().any(|root| dir.starts_with(root)));
+    let mut found = roots_containing(changed, &env.home);
+    // The journal lost what happened under these: search them all.
+    let lost: BTreeSet<PathBuf> = changes
+        .rescan
+        .iter()
+        .filter(|dir| !is_skipped(dir))
+        .flat_map(|dir| match dir.starts_with(&env.home) {
+            true => vec![dir.clone()],
+            false => home_dirs(&env.home).to_vec(),
+        })
+        .collect();
+    found.extend(walk_roots(&Vec::from_iter(lost), &env.home));
+    for root in found.difference(&state.roots) {
+        tracing::info!("found {} in the home directory's changes", root.display());
+    }
+    state.roots.extend(found);
+    state.journal = Some(JournalPosition {
+        volume,
+        event: changes.last_event,
+        read_at: SystemTime::now(),
+    });
+}
+
+/// What a walk of the home directory starts from: home itself, and `~/Library/Caches`, the one
+/// part of `~/Library` macOS does not protect.
+fn home_dirs(home: &Path) -> [PathBuf; 2] {
+    [home.to_path_buf(), home.join("Library/Caches")]
+}
+
+/// Where changes are replayed from: every directory under home a walk enters, and nothing it
+/// skips, so no protected folder is ever named.
+fn watched_dirs(home: &Path) -> Vec<PathBuf> {
+    let Ok(device) = fs::metadata(home).map(|meta| meta.dev()) else {
+        return Vec::new();
+    };
+    let mut dirs = subdirs(home, home, device);
+    dirs.push(home.join("Library/Caches"));
+    dirs
+}
+
+/// Known roots nothing new can appear in unseen, so their changes need no replay: Bazel's
+/// default roots, searched on every pass, and the caches and targets themselves. Nested ones
+/// are left out.
+fn sealed_roots(env: &Env, state: &State) -> Vec<PathBuf> {
+    let is_item = |root: &PathBuf| classify(root).is_some_and(|item| item.path() == root);
+    let candidates: BTreeSet<PathBuf> = default_roots(env)
+        .filter(|root| root.is_dir())
+        .chain(state.roots.iter().filter(|root| is_item(root)).cloned())
+        .collect();
+    let mut sealed: Vec<PathBuf> = Vec::new();
+    for root in candidates {
+        if !sealed.iter().any(|outer| root.starts_with(outer)) {
+            sealed.push(root);
+        }
+    }
+    sealed
+}
+
+/// Search roots of the caches and targets holding `dirs`, directories changed under `home`.
+fn roots_containing<'a>(
+    dirs: impl IntoIterator<Item = &'a PathBuf>,
+    home: &Path,
+) -> BTreeSet<PathBuf> {
+    let mut checked = HashSet::new();
+    let mut roots = BTreeSet::new();
+    for dir in dirs.into_iter().filter(|dir| !is_skipped(dir)) {
+        let ancestors = dir
+            .ancestors()
+            .take_while(|ancestor| *ancestor != home && ancestor.starts_with(home));
+        for ancestor in ancestors {
+            // Its own ancestors were checked with it.
+            if !checked.insert(ancestor.to_path_buf()) {
+                break;
+            }
+            if let Some(item) = classify(ancestor) {
+                roots.extend(search_root(&item));
+                break;
+            }
+        }
+    }
+    roots
+}
+
+/// Search roots of the caches and targets found walking `dirs` all the way down.
+fn walk_roots(dirs: &[PathBuf], home: &Path) -> BTreeSet<PathBuf> {
+    dirs.iter()
+        .flat_map(|dir| walk(dir, usize::MAX, home))
         .filter_map(|item| search_root(&item))
         .collect()
 }
@@ -176,10 +357,6 @@ fn search_root(item: &Item) -> Option<PathBuf> {
 
 /// Classifies directories under `root`, not descending into what it recognizes, nor into
 /// other volumes.
-///
-/// A skipped directory is never opened, not even listed: reading a protected folder such as
-/// `~/Documents` is what makes macOS ask the user for permission. Walkers like `walkdir`
-/// list a directory before letting the caller skip it, hence this hand-written recursion.
 fn walk(root: &Path, max_depth: usize, home: &Path) -> Vec<Item> {
     let Ok(root) = fs::canonicalize(root) else {
         return Vec::new();
@@ -188,39 +365,92 @@ fn walk(root: &Path, max_depth: usize, home: &Path) -> Vec<Item> {
         return Vec::new();
     };
     let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    let skipped_home_dirs: HashSet<PathBuf> = SKIPPED_HOME_DIRS
-        .iter()
-        .map(|name| home.join(name))
-        .collect();
     let mut items = Vec::new();
     let mut pending = vec![(root, 0)];
     while let Some((dir, depth)) = pending.pop() {
         if let Some(item) = classify(&dir) {
             items.push(item);
-            continue;
-        }
-        if depth == max_depth {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            // From the directory listing itself: no symlink is followed, nothing is opened.
-            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            let path = entry.path();
-            let name = entry.file_name();
-            if SKIPPED_NAMES.iter().any(|skip| name == *skip) || skipped_home_dirs.contains(&path) {
-                continue;
-            }
-            if entry.metadata().is_ok_and(|meta| meta.dev() == device) {
-                pending.push((path, depth + 1));
-            }
+        } else if depth < max_depth {
+            let subdirs = subdirs(&dir, &home, device);
+            pending.extend(subdirs.into_iter().map(|subdir| (subdir, depth + 1)));
         }
     }
     items
+}
+
+/// The directories in `dir` a search enters: real directories on `device`, but not the
+/// skipped ones.
+///
+/// A skipped directory is never opened, not even listed: reading a protected folder such as
+/// `~/Documents` is what makes macOS ask the user for permission. Walkers like `walkdir`
+/// list a directory before letting the caller skip it, hence this hand-written recursion.
+fn subdirs(dir: &Path, home: &Path, device: u64) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            // From the directory listing itself: no symlink is followed, nothing is opened.
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && !SKIPPED_NAMES.iter().any(|skip| name == *skip)
+                && !(dir == home && SKIPPED_HOME_DIRS.iter().any(|skip| name == *skip))
+                && entry.metadata().is_ok_and(|meta| meta.dev() == device)
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Paths Bazel was given on the command line, which no bazelrc shows: in the command lines of
+/// running Bazel servers, and in the commands each output base logged to its `java.log`.
+fn bazel_records(env: &Env, output_bases: &[OutputBase]) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    if let Ok(ps) = Command::new("/bin/ps")
+        .args(["-axww", "-o", "command="])
+        .output()
+    {
+        let commands = String::from_utf8_lossy(&ps.stdout);
+        paths.extend(logged_paths(&commands, &[' ', '\n'], None, &env.home));
+    }
+    for base in output_bases {
+        let workspace = match &base.workspace {
+            Workspace::Present(path) => Some(path.as_path()),
+            _ => None,
+        };
+        // `java.log` links to the latest of the logs.
+        let logs = fs::read_dir(&base.path)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().starts_with("java.log")
+                    && entry.file_type().is_ok_and(|kind| kind.is_file())
+            });
+        for log in logs {
+            if let Ok(text) = fs::read(log.path()) {
+                let text = String::from_utf8_lossy(&text);
+                paths.extend(logged_paths(&text, &[',', ']', '\n'], workspace, &env.home));
+            }
+        }
+    }
+    paths
+}
+
+/// Values of `--<path flag>=<value>` arguments in `text`, each value running to one of `ends`.
+fn logged_paths(text: &str, ends: &[char], workspace: Option<&Path>, home: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for flag in PATH_FLAGS {
+        let prefix = format!("--{flag}=");
+        for (at, _) in text.match_indices(&prefix) {
+            let value = text[at + prefix.len()..]
+                .split(ends)
+                .next()
+                .unwrap_or_default();
+            paths.extend(expand(value, workspace, home));
+        }
+    }
+    paths
 }
 
 /// Cache directories named by path flags in a bazelrc file and the files it imports. Flags
@@ -381,7 +611,7 @@ mod tests {
         disk_cache(&env.home.join("Library/Caches/other/disk"), &[]);
         disk_cache(&env.home.join("Library/Developer/disk"), &[]);
 
-        let roots = scan_home(&env);
+        let roots = walk_roots(&home_dirs(&env.home), &env.home);
         assert_eq!(
             roots,
             BTreeSet::from([
@@ -391,7 +621,7 @@ mod tests {
         );
 
         let state = State {
-            last_home_scan: Some(now),
+            journal: None,
             roots,
         };
         let inventory = discover(&env, &[], &state);
@@ -412,9 +642,89 @@ mod tests {
         fs::set_permissions(&documents, mode(0o000)).unwrap();
         disk_cache(&env.home.join("src/a/b/c/disk"), &[]);
 
-        let roots = scan_home(&env);
+        let roots = walk_roots(&home_dirs(&env.home), &env.home);
         fs::set_permissions(&documents, mode(0o755)).unwrap();
         assert_eq!(roots, BTreeSet::from([env.home.join("src/a/b/c/disk")]));
+    }
+
+    #[test]
+    fn a_changed_directory_leads_to_the_cache_holding_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let cache = disk_cache(&env.home.join("src/a/disk"), &[]);
+        disk_cache(&env.home.join("src/node_modules/disk"), &[]);
+        fs::create_dir_all(env.home.join("src/other")).unwrap();
+        let changed = [
+            cache.join("ac/00"),
+            cache.join("cas/00"),
+            env.home.join("src/node_modules/disk/ac/00"),
+            env.home.join("src/other"),
+            env.home.join("src/deleted"),
+        ];
+        assert_eq!(
+            roots_containing(&changed, &env.home),
+            BTreeSet::from([cache])
+        );
+    }
+
+    #[test]
+    fn follows_the_home_directory_through_its_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let mut state = State::default();
+        walk_home(&env, &mut state);
+        assert!(state.journal.is_some());
+        assert!(state.roots.is_empty());
+
+        let cache = disk_cache(&env.home.join("new/a/disk"), &[]);
+        // Events reach the journal a little late.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !state.roots.contains(&cache) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(500));
+            follow_home(&env, &mut state);
+        }
+        assert_eq!(state.roots, BTreeSet::from([cache]));
+    }
+
+    #[test]
+    fn refresh_forgets_roots_that_are_gone_but_not_those_left_in_trash() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let cache = disk_cache(&env.home.join("src/disk"), &[]);
+        let target = env.home.join("src/repo/target");
+        fs::create_dir_all(env.home.join("src/repo/.cendrillon-trash-target-1700")).unwrap();
+        let gone = env.home.join("src/gone");
+        let mut state = State {
+            journal: None,
+            roots: BTreeSet::from([cache.clone(), target.clone(), gone.clone()]),
+        };
+        refresh(&env, &[], &mut state, HomeSearch::Skip);
+        assert!(state.roots.contains(&cache));
+        assert!(state.roots.contains(&target));
+        assert!(!state.roots.contains(&gone));
+    }
+
+    #[test]
+    fn reads_path_flags_from_server_command_lines_and_logged_commands() {
+        let home = Path::new("/home");
+        let ps = "/usr/bin/zsh\n\
+                  bazel(repo) -jar A-server.jar --output_user_root=/root \
+                  --output_base=/root/abcd --install_base=/root/install/ef\n";
+        assert_eq!(
+            logged_paths(ps, &[' ', '\n'], None, home),
+            [
+                PathBuf::from("/root"),
+                PathBuf::from("/root/abcd"),
+                PathBuf::from("/root/install/ef"),
+            ]
+        );
+        let log = "261020 07:22:57.714:I 53 [GrpcServerImpl.executeCommand] [build, \
+                   --disk_cache=, --disk_cache=~/disk, --experimental_disk_cache_gc_max_size=1, \
+                   --repository_cache=%workspace%/repos]\n";
+        assert_eq!(
+            logged_paths(log, &[',', ']', '\n'], Some(Path::new("/ws")), home),
+            [PathBuf::from("/home/disk"), PathBuf::from("/ws/repos")]
+        );
     }
 
     #[test]
@@ -424,7 +734,7 @@ mod tests {
         let trash = env.home.join("src/repo/.cendrillon-trash-target-1700");
         fs::create_dir_all(trash.join("debug")).unwrap();
         let state = State {
-            last_home_scan: None,
+            journal: None,
             roots: BTreeSet::from([env.home.join("src/repo/target")]),
         };
         assert_eq!(discover(&env, &[], &state).trash, [trash]);
@@ -436,12 +746,25 @@ mod tests {
         let path = dir.path().join("sub/state.json");
         assert_eq!(State::load(&path), State::default());
         let state = State {
-            last_home_scan: Some(SystemTime::UNIX_EPOCH),
+            journal: Some(JournalPosition {
+                volume: "0123".into(),
+                event: 7,
+                read_at: SystemTime::UNIX_EPOCH,
+            }),
             roots: BTreeSet::from([PathBuf::from("/a")]),
         };
         state.save(&path).unwrap();
         assert_eq!(State::load(&path), state);
         fs::write(&path, "{").unwrap();
         assert_eq!(State::load(&path), State::default());
+        // Written before the journal was followed: the roots stay, and a walk comes first.
+        fs::write(&path, r#"{"last_home_scan": null, "roots": ["/a"]}"#).unwrap();
+        assert_eq!(
+            State::load(&path),
+            State {
+                journal: None,
+                roots: BTreeSet::from([PathBuf::from("/a")]),
+            }
+        );
     }
 }

@@ -15,7 +15,7 @@ cendrillon install   # start now and at every login
 ```
 
 > [!WARNING]
-> The first few runs walk your home directory and may delete a backlog of files. Expect `fseventsd` (the macOS file events service) to use noticeable CPU for a while. It settles once the backlog is gone.
+> The first run walks your home directory once, and the first few runs may delete a backlog of files. Expect `fseventsd` (the macOS file events service) to use noticeable CPU for a while. It settles once the backlog is gone.
 
 Trust issues? Look first:
 ```sh
@@ -74,10 +74,18 @@ Incremental-compilation directories follow their crate's units.
 - Paths given to `--output_user_root`, `--output_base`, `--install_base`, `--disk_cache` and `--repository_cache` in:
   - `~/.bazelrc` and `/etc/bazel.bazelrc`
   - the `.bazelrc` of every workspace it finds, following `import` and `try-import`
-- Your home directory, once a day. It skips:
+  - the command lines of running Bazel servers
+  - the commands each output base logged to its `java.log`, so flags given only on the command line count too
+- Your home directory. It skips:
   - folders macOS protects (Desktop, Documents, Downloads, Pictures, Movies, Music, Public, `~/Library` except `~/Library/Caches`), so no Full Disk Access and no permission prompt
   - `.git`, `node_modules`, `.Trash`, `.rustup`
   - other volumes
+
+### How it searches your home directory
+- The first run walks it.
+- After that, before each sweep, it replays the macOS file events journal from where it left off. It checks only the directories that changed. A build writes into its target, so every new target shows up.
+- If the journal lost track of a folder, it walks that folder. It walks everything again only when macOS reset the journal, or the daemon was off for over a week.
+- `cendrillon scan` walks it now.
 
 ### What it recognizes
 Anything recognized may be deleted, so it is picky:
@@ -112,8 +120,7 @@ recent_use_floor = "2h"       # never evict anything used more recently
 tick_interval = "60s"         # deleted-workspace and disk-pressure checks
 sweep_interval = "1h"         # idle deadlines
 pressure_cooldown = "10m"
-scan_home = true
-home_scan_interval = "24h"
+scan_home = true              # find caches and targets anywhere in your home directory
 extra_roots = []              # more directories to search for caches and targets
 ```
 

@@ -4,6 +4,7 @@ mod daemon;
 mod discovery;
 mod env;
 mod executor;
+mod fsevents;
 mod inventory;
 mod launchd;
 mod planner;
@@ -54,7 +55,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Walk the home directory for caches and targets in unusual places.
+    /// Walk the whole home directory for caches and targets now, rather than follow its changes.
     Scan,
     /// Clean continuously in the foreground; this is what launchd runs.
     Daemon,
@@ -101,7 +102,12 @@ fn main() -> Result<()> {
             report(executor.dry_run, freed);
             Ok(())
         }
-        Command::Scan => daemon::scan_home(&env, &mut State::load(&env.state_file())),
+        Command::Scan => daemon::refresh(
+            &env,
+            &config,
+            &mut State::load(&env.state_file()),
+            discovery::HomeSearch::Walk,
+        ),
         Command::Daemon => daemon::run(&env, &config),
         Command::Install => launchd::install(&env),
         Command::Uninstall => launchd::uninstall(&env),

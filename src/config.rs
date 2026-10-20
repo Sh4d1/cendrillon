@@ -43,11 +43,9 @@ pub struct Config {
     /// (for example after thinning local snapshots) is not reclaimed twice.
     #[serde(with = "humantime_serde")]
     pub pressure_cooldown: Duration,
-    /// Walk the home directory for Bazel caches in unusual places.
+    /// Find caches and targets anywhere in the home directory: walk it once, then follow its
+    /// changes.
     pub scan_home: bool,
-    /// How often to walk the home directory.
-    #[serde(with = "humantime_serde")]
-    pub home_scan_interval: Duration,
     /// Extra directories to search for Bazel caches, besides the defaults and bazelrc files.
     pub extra_roots: Vec<PathBuf>,
 }
@@ -70,7 +68,6 @@ impl Default for Config {
             sweep_interval: HOUR,
             pressure_cooldown: Duration::from_secs(600),
             scan_home: true,
-            home_scan_interval: 24 * HOUR,
             extra_roots: Vec::new(),
         }
     }
@@ -98,7 +95,6 @@ impl Config {
             ("tick_interval", config.tick_interval),
             ("sweep_interval", config.sweep_interval),
             ("pressure_cooldown", config.pressure_cooldown),
-            ("home_scan_interval", config.home_scan_interval),
             ("target_idle", config.target_idle),
         ];
         for (name, interval) in intervals {

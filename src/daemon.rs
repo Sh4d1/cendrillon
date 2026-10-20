@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 
 use crate::config::Config;
-use crate::discovery::{self, State};
+use crate::discovery::{self, HomeSearch, State};
 use crate::env::Env;
 use crate::executor::{Executor, format_bytes};
 use crate::inventory::{Inventory, Usage};
@@ -88,21 +88,15 @@ impl Cleaner<'_> {
     }
 }
 
-/// Walks the home directory and records where it found caches.
-pub fn scan_home(env: &Env, state: &mut State) -> Result<()> {
-    let started = Instant::now();
-    state.roots = discovery::scan_home(env);
-    state.last_home_scan = Some(SystemTime::now());
-    tracing::info!(
-        "home scan found {} cache locations in {:.0?}",
-        state.roots.len(),
-        started.elapsed()
-    );
+/// Learns where caches and targets are, and saves it for the next run.
+pub fn refresh(env: &Env, config: &Config, state: &mut State, home: HomeSearch) -> Result<()> {
+    discovery::refresh(env, &config.extra_roots, state, home);
     state.save(&env.state_file())
 }
 
 /// Cleans until SIGTERM or SIGINT: orphaned output bases every tick, the idle deadlines
-/// every sweep interval, and sooner when the disk is nearly full.
+/// every sweep interval, and sooner when the disk is nearly full. Before each of those, learns
+/// of new caches and targets.
 pub fn run(env: &Env, config: &Config) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
@@ -131,15 +125,6 @@ pub fn run(env: &Env, config: &Config) -> Result<()> {
     );
 
     while !stop.load(Ordering::Relaxed) {
-        let home_scan_due = state
-            .last_home_scan
-            .is_none_or(|time| time.elapsed().unwrap_or_default() >= config.home_scan_interval);
-        if config.scan_home
-            && home_scan_due
-            && let Err(e) = scan_home(env, &mut state)
-        {
-            tracing::warn!("home scan failed: {e:#}");
-        }
         let started = Instant::now();
         let disk = if started >= next_pressure_check {
             cleaner.disk_under_pressure().unwrap_or_else(|e| {
@@ -155,6 +140,16 @@ pub fn run(env: &Env, config: &Config) -> Result<()> {
             None if sweep_due => Pass::Full,
             None => Pass::Orphans,
         };
+        let home = if config.scan_home {
+            HomeSearch::Follow
+        } else {
+            HomeSearch::Skip
+        };
+        if !matches!(pass, Pass::Orphans)
+            && let Err(e) = refresh(env, config, &mut state, home)
+        {
+            tracing::warn!("saving what was found: {e:#}");
+        }
         let freed = cleaner.pass(&state, pass).unwrap_or_else(|e| {
             tracing::warn!("pass failed: {e:#}");
             0
