@@ -14,6 +14,9 @@ cargo install cendrillon
 cendrillon install   # start now and at every login
 ```
 
+> [!WARNING]
+> The first few runs walk your home directory and may delete a backlog of files. Expect `fseventsd` (the macOS file events service) to use noticeable CPU for a while. It settles once the backlog is gone.
+
 Trust issues? Look first:
 ```sh
 cendrillon status                 # caches and targets found, with size and last use
