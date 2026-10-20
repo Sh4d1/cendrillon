@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use nix::unistd::getuid;
@@ -24,17 +24,26 @@ pub fn install(env: &Env) -> Result<()> {
         .with_context(|| format!("writing {}", plist_path.display()))?;
 
     let domain = format!("gui/{}", getuid());
+    let service = format!("{domain}/{LABEL}");
     // Replace a running instance, which may be an older binary.
-    let _ = launchctl(&["bootout", &format!("{domain}/{LABEL}")]);
-    // bootout returns before the old instance is gone; bootstrap fails until it is.
-    let plist_arg = plist_path.to_string_lossy();
-    let mut attempts = 0;
-    while let Err(e) = launchctl(&["bootstrap", &domain, &plist_arg]) {
-        attempts += 1;
-        if attempts == 10 {
-            return Err(e);
+    let _ = launchctl(&["bootout", &service]);
+    // bootout returns before the old instance is gone, and bootstrap fails until it is.
+    // launchd kills an instance that has not exited after ExitTimeOut, 20 s by default.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while launchctl(&["print", &service]).is_ok() {
+        if Instant::now() >= deadline {
+            bail!("the previous {LABEL} agent did not stop within 30 s");
         }
-        sleep(Duration::from_millis(500));
+        sleep(Duration::from_millis(200));
+    }
+    if let Err(e) = launchctl(&["bootstrap", &domain, &plist_path.to_string_lossy()]) {
+        if is_disabled(&domain) {
+            bail!(
+                "{LABEL} is disabled. Turn it on in System Settings > General > Login Items, \
+                 or run `launchctl enable {service}`, then install again."
+            );
+        }
+        return Err(e);
     }
     println!(
         "Installed {} running {}",
@@ -67,6 +76,23 @@ fn launchctl(args: &[&str]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether the agent was turned off in Login Items or by `launchctl disable`.
+fn is_disabled(domain: &str) -> bool {
+    let Ok(output) = Command::new("/bin/launchctl")
+        .args(["print-disabled", domain])
+        .output()
+    else {
+        return false;
+    };
+    let entry = format!("\"{LABEL}\" => ");
+    // Older macOS prints `=> true` rather than `=> disabled`.
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.trim()
+            .strip_prefix(&entry)
+            .is_some_and(|state| state == "disabled" || state == "true")
+    })
 }
 
 /// A low-priority background agent that starts at login and is restarted if it dies.
