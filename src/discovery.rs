@@ -204,7 +204,7 @@ fn walk_home(env: &Env, state: &mut State) {
     let started = Instant::now();
     let volume = fsevents::volume(&env.home);
     let event = fsevents::current_event();
-    let found = walk_roots(&home_dirs(&env.home), &env.home);
+    let found = walk_roots(std::slice::from_ref(&env.home), &env.home);
     tracing::info!(
         "walked the home directory in {:.0?}: {} cache locations",
         started.elapsed(),
@@ -259,9 +259,9 @@ fn follow_home(env: &Env, state: &mut State) {
         .rescan
         .iter()
         .filter(|dir| !is_skipped(dir))
-        .flat_map(|dir| match dir.starts_with(&env.home) {
-            true => vec![dir.clone()],
-            false => home_dirs(&env.home).to_vec(),
+        .map(|dir| match dir.starts_with(&env.home) {
+            true => dir.clone(),
+            false => env.home.clone(),
         })
         .collect();
     found.extend(walk_roots(&Vec::from_iter(lost), &env.home));
@@ -276,21 +276,15 @@ fn follow_home(env: &Env, state: &mut State) {
     });
 }
 
-/// What a walk of the home directory starts from: home itself, and `~/Library/Caches`, the one
-/// part of `~/Library` macOS does not protect.
-fn home_dirs(home: &Path) -> [PathBuf; 2] {
-    [home.to_path_buf(), home.join("Library/Caches")]
-}
-
 /// Where changes are replayed from: every directory under home a walk enters, and nothing it
-/// skips, so no protected folder is ever named.
+/// skips, so no protected folder is ever named. `~/Library/Caches` is left out too: it holds
+/// Apple's own caches, guarded by privacy checks (media library, Full Disk Access), and the
+/// Bazel caches in it are a default root or named in Bazel's records.
 fn watched_dirs(home: &Path) -> Vec<PathBuf> {
     let Ok(device) = fs::metadata(home).map(|meta| meta.dev()) else {
         return Vec::new();
     };
-    let mut dirs = subdirs(home, home, device);
-    dirs.push(home.join("Library/Caches"));
-    dirs
+    subdirs(home, home, device)
 }
 
 /// Known roots nothing new can appear in unseen, so their changes need no replay: Bazel's
@@ -608,16 +602,16 @@ mod tests {
         );
         disk_cache(&env.home.join("Documents/cache"), &[]);
         disk_cache(&env.home.join("src/node_modules/cache"), &[]);
-        disk_cache(&env.home.join("Library/Caches/other/disk"), &[]);
+        disk_cache(&env.home.join("Library/Caches/com.apple.Music/disk"), &[]);
         disk_cache(&env.home.join("Library/Developer/disk"), &[]);
+        let bazel = disk_cache(&env.home.join("Library/Caches/bazel/disk"), &[]);
 
-        let roots = walk_roots(&home_dirs(&env.home), &env.home);
-        assert_eq!(
-            roots,
-            BTreeSet::from([
-                env.home.join("odd/place/root"),
-                env.home.join("Library/Caches/other/disk"),
-            ])
+        let roots = walk_roots(std::slice::from_ref(&env.home), &env.home);
+        assert_eq!(roots, BTreeSet::from([env.home.join("odd/place/root")]));
+        assert!(
+            !watched_dirs(&env.home)
+                .iter()
+                .any(|dir| dir.starts_with(env.home.join("Library")))
         );
 
         let state = State {
@@ -626,7 +620,9 @@ mod tests {
         };
         let inventory = discover(&env, &[], &state);
         assert_eq!(inventory.output_bases.len(), 1);
+        // Bazel's folder in `~/Library/Caches` is a default root.
         assert_eq!(inventory.caches.len(), 1);
+        assert_eq!(inventory.caches[0].root, bazel);
     }
 
     #[test]
@@ -642,7 +638,7 @@ mod tests {
         fs::set_permissions(&documents, mode(0o000)).unwrap();
         disk_cache(&env.home.join("src/a/b/c/disk"), &[]);
 
-        let roots = walk_roots(&home_dirs(&env.home), &env.home);
+        let roots = walk_roots(std::slice::from_ref(&env.home), &env.home);
         fs::set_permissions(&documents, mode(0o755)).unwrap();
         assert_eq!(roots, BTreeSet::from([env.home.join("src/a/b/c/disk")]));
     }

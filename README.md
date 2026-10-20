@@ -77,7 +77,7 @@ Incremental-compilation directories follow their crate's units.
   - the command lines of running Bazel servers
   - the commands each output base logged to its `java.log`, so flags given only on the command line count too
 - Your home directory. It skips:
-  - folders macOS protects (Desktop, Documents, Downloads, Pictures, Movies, Music, Public, `~/Library` except `~/Library/Caches`), so no Full Disk Access and no permission prompt
+  - folders macOS protects (Desktop, Documents, Downloads, Pictures, Movies, Music, Public, `~/Library`), so no Full Disk Access and no permission prompt. Bazel's folder in `~/Library/Caches` is a default root, and Bazel caches elsewhere in it are named in Bazel's records.
   - `.git`, `node_modules`, `.Trash`, `.rustup`
   - other volumes
 
