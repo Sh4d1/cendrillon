@@ -2,11 +2,11 @@
 name = "cendrillon"
 version = "0.1.0"
 edition = "2024"
-description = "A macOS background daemon that deletes unused Bazel caches"
+description = "A macOS background daemon that deletes unused Bazel caches and Cargo build output"
 license = "MIT"
 repository = "https://github.com/ae2rs/cendrillon"
 readme = "README.md"
-keywords = ["bazel", "cache", "macos", "launchd", "disk"]
+keywords = ["bazel", "cargo", "cache", "macos", "disk"]
 categories = ["command-line-utilities", "development-tools::build-utils"]
 
 [dependencies]
