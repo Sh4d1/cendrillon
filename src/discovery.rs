@@ -1,20 +1,22 @@
 //! Finding Bazel caches and Cargo targets: the default locations, paths named in bazelrc files
-//! and in Bazel's own records, and the home directory, walked once and then followed through
-//! its change journal.
+//! and in Bazel's own records, and the home directory. On macOS, the home directory is walked
+//! once and then followed through its change journal; Linux keeps no such journal, so it is
+//! walked again every few hours.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::env::Env;
+#[cfg(target_os = "macos")]
 use crate::fsevents;
 use crate::inventory::{Inventory, Item, MARKERS, OutputBase, TRASH_PREFIX, Workspace, classify};
+use crate::sys;
 
 /// Deep enough to reach `<root>/<output_user_root>/install/<md5>`.
 const ROOT_DEPTH: usize = 3;
@@ -29,9 +31,11 @@ const PATH_FLAGS: [&str; 5] = [
 ];
 
 /// Directories never walked: they are huge and hold no cache (`.git`, `node_modules`), belong
-/// to a tool that manages them (`.rustup` toolchains), or reading them makes macOS ask the
-/// user for permission.
+/// to a tool that manages them (`.rustup` toolchains), hold deleted files (the trash), or
+/// reading them makes macOS ask the user for permission. Home directories are given relative
+/// to it.
 const SKIPPED_NAMES: [&str; 4] = [".git", "node_modules", ".Trash", ".rustup"];
+#[cfg(target_os = "macos")]
 const SKIPPED_HOME_DIRS: [&str; 8] = [
     "Desktop",
     "Documents",
@@ -42,17 +46,30 @@ const SKIPPED_HOME_DIRS: [&str; 8] = [
     "Pictures",
     "Public",
 ];
+#[cfg(target_os = "linux")]
+const SKIPPED_HOME_DIRS: [&str; 1] = [".local/share/Trash"];
 
 /// After this long without a replay, the journal may have dropped part of the history since:
 /// walk the home directory again instead.
+#[cfg(target_os = "macos")]
 const JOURNAL_MAX_GAP: Duration = Duration::from_secs(7 * 24 * 3600);
+#[cfg(target_os = "macos")]
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Without a journal, how long a walk of the home directory stays current. A target that
+/// appears in between waits this long to be trimmed, which only matters once it is large.
+#[cfg(target_os = "linux")]
+const WALK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 
 /// Where caches were found, kept between runs.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     /// How far the home directory's change journal was read; `None` until the first walk.
+    /// Always `None` on Linux, which keeps no journal.
     pub journal: Option<JournalPosition>,
+    /// When the home directory was last walked.
+    #[serde(default)]
+    pub last_walk: Option<SystemTime>,
     /// Directories to search on every pass, besides the defaults.
     pub roots: BTreeSet<PathBuf>,
 }
@@ -142,7 +159,7 @@ pub fn discover(env: &Env, extra_roots: &[PathBuf], state: &State) -> Inventory 
 pub enum HomeSearch {
     Skip,
     /// Replay what changed since last time. Walk instead the first time, or when the journal
-    /// lost track.
+    /// lost track. On Linux, walk if the last walk is a few hours old.
     Follow,
     /// Walk it all.
     Walk,
@@ -190,6 +207,7 @@ fn trash_beside(root: &Path) -> Vec<Item> {
 }
 
 /// Where Bazel puts caches unless told otherwise, plus the usual macOS cache directory.
+#[cfg(target_os = "macos")]
 fn default_roots(env: &Env) -> impl Iterator<Item = PathBuf> {
     [
         PathBuf::from(format!("/private/var/tmp/_bazel_{}", env.user)),
@@ -199,11 +217,22 @@ fn default_roots(env: &Env) -> impl Iterator<Item = PathBuf> {
     .into_iter()
 }
 
+/// Where Bazel puts caches unless told otherwise: `$XDG_CACHE_HOME/bazel`, by default
+/// `~/.cache/bazel`. The variable is read when set, but the service may not see it.
+#[cfg(target_os = "linux")]
+fn default_roots(env: &Env) -> impl Iterator<Item = PathBuf> {
+    let xdg = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("bazel"));
+    std::iter::once(env.home.join(".cache/bazel")).chain(xdg)
+}
+
 /// Walks the home directory and starts following its journal from before the walk.
 fn walk_home(env: &Env, state: &mut State) {
     let started = Instant::now();
-    let volume = fsevents::volume(&env.home);
-    let event = fsevents::current_event();
+    #[cfg(target_os = "macos")]
+    let (volume, event) = (fsevents::volume(&env.home), fsevents::current_event());
     let found = walk_roots(std::slice::from_ref(&env.home), &env.home);
     tracing::info!(
         "walked the home directory in {:.0?}: {} cache locations",
@@ -211,14 +240,30 @@ fn walk_home(env: &Env, state: &mut State) {
         found.len()
     );
     state.roots.extend(found);
-    state.journal = volume.map(|volume| JournalPosition {
-        volume,
-        event,
-        read_at: SystemTime::now(),
-    });
+    state.last_walk = Some(SystemTime::now());
+    #[cfg(target_os = "macos")]
+    {
+        state.journal = volume.map(|volume| JournalPosition {
+            volume,
+            event,
+            read_at: SystemTime::now(),
+        });
+    }
+}
+
+/// Walks the home directory again once the last walk is a few hours old.
+#[cfg(target_os = "linux")]
+fn follow_home(env: &Env, state: &mut State) {
+    let due = state
+        .last_walk
+        .is_none_or(|time| time.elapsed().is_ok_and(|age| age >= WALK_INTERVAL));
+    if due {
+        walk_home(env, state);
+    }
 }
 
 /// Learns from what changed in the home directory since the last walk or replay.
+#[cfg(target_os = "macos")]
 fn follow_home(env: &Env, state: &mut State) {
     let Some(volume) = fsevents::volume(&env.home) else {
         tracing::warn!("the home volume keeps no change journal; not searching it");
@@ -280,6 +325,7 @@ fn follow_home(env: &Env, state: &mut State) {
 /// skips, so no protected folder is ever named. `~/Library/Caches` is left out too: it holds
 /// Apple's own caches, guarded by privacy checks (media library, Full Disk Access), and the
 /// Bazel caches in it are a default root or named in Bazel's records.
+#[cfg(target_os = "macos")]
 fn watched_dirs(home: &Path) -> Vec<PathBuf> {
     let Ok(device) = fs::metadata(home).map(|meta| meta.dev()) else {
         return Vec::new();
@@ -293,6 +339,7 @@ fn watched_dirs(home: &Path) -> Vec<PathBuf> {
 /// Known roots nothing new can appear in unseen, so their changes need no replay: Bazel's
 /// default roots, searched on every pass, and the caches and targets themselves. Nested ones
 /// are left out.
+#[cfg(target_os = "macos")]
 fn sealed_roots(env: &Env, state: &State) -> Vec<PathBuf> {
     let is_item = |root: &PathBuf| classify(root).is_some_and(|item| item.path() == root);
     let candidates: BTreeSet<PathBuf> = default_roots(env)
@@ -309,6 +356,7 @@ fn sealed_roots(env: &Env, state: &State) -> Vec<PathBuf> {
 }
 
 /// Search roots of the caches and targets holding `dirs`, directories changed under `home`.
+#[cfg(target_os = "macos")]
 fn roots_containing<'a>(
     dirs: impl IntoIterator<Item = &'a PathBuf>,
     home: &Path,
@@ -401,7 +449,11 @@ fn subdirs(dir: &Path, entries: Vec<fs::DirEntry>, home: &Path, device: u64) -> 
             // From the directory listing itself: no symlink is followed, nothing is opened.
             entry.file_type().is_ok_and(|kind| kind.is_dir())
                 && !SKIPPED_NAMES.iter().any(|skip| name == *skip)
-                && !(dir == home && SKIPPED_HOME_DIRS.iter().any(|skip| name == *skip))
+                && !dir.join(&name).strip_prefix(home).is_ok_and(|relative| {
+                    SKIPPED_HOME_DIRS
+                        .iter()
+                        .any(|skip| relative == Path::new(skip))
+                })
                 && entry.metadata().is_ok_and(|meta| meta.dev() == device)
         })
         .map(|entry| entry.path())
@@ -412,12 +464,8 @@ fn subdirs(dir: &Path, entries: Vec<fs::DirEntry>, home: &Path, device: u64) -> 
 /// running Bazel servers, and in the commands each output base logged to its `java.log`.
 fn bazel_records(env: &Env, output_bases: &[OutputBase]) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::new();
-    if let Ok(ps) = Command::new("/bin/ps")
-        .args(["-axww", "-o", "command="])
-        .output()
-    {
-        let commands = String::from_utf8_lossy(&ps.stdout);
-        paths.extend(logged_paths(&commands, &[' ', '\n'], None, &env.home));
+    for command in sys::command_lines() {
+        paths.extend(logged_paths(&command, &[' ', '\n'], None, &env.home));
     }
     for base in output_bases {
         let workspace = match &base.workspace {
@@ -575,6 +623,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn discovers_default_root_and_caches_named_by_workspace_bazelrc() {
         let dir = tempfile::tempdir().unwrap();
         let env = env(dir.path());
@@ -602,6 +651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn home_scan_finds_caches_and_skips_protected_folders() {
         let dir = tempfile::tempdir().unwrap();
         let env = env(dir.path());
@@ -628,6 +678,7 @@ mod tests {
 
         let state = State {
             journal: None,
+            last_walk: None,
             roots,
         };
         let inventory = discover(&env, &[], &state);
@@ -635,6 +686,77 @@ mod tests {
         // Bazel's folder in `~/Library/Caches` is a default root.
         assert_eq!(inventory.caches.len(), 1);
         assert_eq!(inventory.caches[0].root, bazel);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn discovers_default_root_and_caches_named_by_workspace_bazelrc() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let workspace = env.home.join("work/repo");
+        fs::create_dir_all(&workspace).unwrap();
+        let elsewhere = env.home.join("elsewhere/disk");
+        fs::write(
+            workspace.join(".bazelrc"),
+            format!("build --disk_cache={}\n", elsewhere.display()),
+        )
+        .unwrap();
+        let user_root = env.home.join(".cache/bazel/_bazel_test");
+        let now = SystemTime::now();
+        output_base(&user_root, "aaaa", &workspace, now);
+        let install = user_root.join("install/e15394ac7311f82db7c708c94ae7eeac");
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("build-label.txt"), "9.2.0").unwrap();
+        disk_cache(&elsewhere, &[]);
+
+        let inventory = discover(&env, &[], &State::default());
+        assert_eq!(inventory.output_bases.len(), 1);
+        assert_eq!(inventory.install_bases.len(), 1);
+        assert_eq!(inventory.caches.len(), 1);
+        assert_eq!(inventory.caches[0].root, elsewhere);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn home_scan_finds_caches_and_skips_the_trash() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let now = SystemTime::now();
+        output_base(
+            &env.home.join("odd/place/root"),
+            "bbbb",
+            Path::new("/x"),
+            now,
+        );
+        disk_cache(&env.home.join(".local/share/Trash/files/disk"), &[]);
+        disk_cache(&env.home.join("src/node_modules/cache"), &[]);
+        let documents = disk_cache(&env.home.join("Documents/cache"), &[]);
+
+        let roots = walk_roots(std::slice::from_ref(&env.home), &env.home);
+        assert_eq!(
+            roots,
+            BTreeSet::from([env.home.join("odd/place/root"), documents])
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn walks_the_home_directory_again_once_the_last_walk_is_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let mut state = State::default();
+        follow_home(&env, &mut state);
+        let walked = state.last_walk.unwrap();
+        assert!(state.roots.is_empty());
+
+        let cache = disk_cache(&env.home.join("new/a/disk"), &[]);
+        follow_home(&env, &mut state);
+        assert_eq!(state.last_walk, Some(walked));
+        assert!(state.roots.is_empty());
+
+        state.last_walk = Some(walked - WALK_INTERVAL);
+        follow_home(&env, &mut state);
+        assert_eq!(state.roots, BTreeSet::from([cache]));
     }
 
     #[test]
@@ -694,6 +816,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_changed_directory_leads_to_the_cache_holding_it() {
         let dir = tempfile::tempdir().unwrap();
         let env = env(dir.path());
@@ -714,6 +837,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn follows_the_home_directory_through_its_journal() {
         let dir = tempfile::tempdir().unwrap();
         let env = env(dir.path());
@@ -742,6 +866,7 @@ mod tests {
         let gone = env.home.join("src/gone");
         let mut state = State {
             journal: None,
+            last_walk: None,
             roots: BTreeSet::from([cache.clone(), target.clone(), gone.clone()]),
         };
         refresh(&env, &[], &mut state, HomeSearch::Skip);
@@ -781,6 +906,7 @@ mod tests {
         fs::create_dir_all(trash.join("debug")).unwrap();
         let state = State {
             journal: None,
+            last_walk: None,
             roots: BTreeSet::from([env.home.join("src/repo/target")]),
         };
         assert_eq!(discover(&env, &[], &state).trash, [trash]);
@@ -797,6 +923,7 @@ mod tests {
                 event: 7,
                 read_at: SystemTime::UNIX_EPOCH,
             }),
+            last_walk: Some(SystemTime::UNIX_EPOCH),
             roots: BTreeSet::from([PathBuf::from("/a")]),
         };
         state.save(&path).unwrap();
@@ -809,6 +936,7 @@ mod tests {
             State::load(&path),
             State {
                 journal: None,
+                last_walk: None,
                 roots: BTreeSet::from([PathBuf::from("/a")]),
             }
         );
