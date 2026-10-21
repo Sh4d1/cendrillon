@@ -76,6 +76,17 @@ pub enum CacheKind {
     Repository,
 }
 
+/// Entries one of which every directory [`classify`] recognizes holds, trash aside: an output
+/// base's `DO_NOT_BUILD_HERE`, an install base's `build-label.txt`, a Cargo target's
+/// `.rustc_info.json`, a disk cache's `ac/`, a repository cache's `content_addressable/`.
+pub const MARKERS: [&str; 5] = [
+    "DO_NOT_BUILD_HERE",
+    "build-label.txt",
+    ".rustc_info.json",
+    "ac",
+    "content_addressable",
+];
+
 /// Recognizes a directory Bazel or Cargo manages from the markers they leave in it. The checks
 /// are strict, because whatever matches under the home directory may be deleted.
 pub fn classify(dir: &Path) -> Option<Item> {

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::env::Env;
 use crate::fsevents;
-use crate::inventory::{Inventory, Item, OutputBase, TRASH_PREFIX, Workspace, classify};
+use crate::inventory::{Inventory, Item, MARKERS, OutputBase, TRASH_PREFIX, Workspace, classify};
 
 /// Deep enough to reach `<root>/<output_user_root>/install/<md5>`.
 const ROOT_DEPTH: usize = 3;
@@ -284,7 +284,10 @@ fn watched_dirs(home: &Path) -> Vec<PathBuf> {
     let Ok(device) = fs::metadata(home).map(|meta| meta.dev()) else {
         return Vec::new();
     };
-    subdirs(home, home, device)
+    let entries = fs::read_dir(home)
+        .map(|entries| entries.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    subdirs(home, entries, home, device)
 }
 
 /// Known roots nothing new can appear in unseen, so their changes need no replay: Bazel's
@@ -362,28 +365,37 @@ fn walk(root: &Path, max_depth: usize, home: &Path) -> Vec<Item> {
     let mut items = Vec::new();
     let mut pending = vec![(root, 0)];
     while let Some((dir, depth)) = pending.pop() {
-        if let Some(item) = classify(&dir) {
+        // Listed once, both to skip `classify` where no marker is, which spares most of the
+        // system calls of a walk, and to find the subdirectories.
+        let entries: Option<Vec<fs::DirEntry>> = fs::read_dir(&dir)
+            .ok()
+            .map(|entries| entries.filter_map(Result::ok).collect());
+        let may_be_item = entries.as_ref().is_none_or(|entries| {
+            entries
+                .iter()
+                .any(|entry| MARKERS.iter().any(|marker| entry.file_name() == *marker))
+        }) || dir
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(TRASH_PREFIX));
+        if let Some(item) = may_be_item.then(|| classify(&dir)).flatten() {
             items.push(item);
         } else if depth < max_depth {
-            let subdirs = subdirs(&dir, &home, device);
+            let subdirs = subdirs(&dir, entries.unwrap_or_default(), &home, device);
             pending.extend(subdirs.into_iter().map(|subdir| (subdir, depth + 1)));
         }
     }
     items
 }
 
-/// The directories in `dir` a search enters: real directories on `device`, but not the
-/// skipped ones.
+/// The directories in `dir`, listed as `entries`, that a search enters: real directories on
+/// `device`, but not the skipped ones.
 ///
 /// A skipped directory is never opened, not even listed: reading a protected folder such as
 /// `~/Documents` is what makes macOS ask the user for permission. Walkers like `walkdir`
 /// list a directory before letting the caller skip it, hence this hand-written recursion.
-fn subdirs(dir: &Path, home: &Path, device: u64) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
+fn subdirs(dir: &Path, entries: Vec<fs::DirEntry>, home: &Path, device: u64) -> Vec<PathBuf> {
     entries
-        .filter_map(Result::ok)
+        .into_iter()
         .filter(|entry| {
             let name = entry.file_name();
             // From the directory listing itself: no symlink is followed, nothing is opened.
@@ -623,6 +635,44 @@ mod tests {
         // Bazel's folder in `~/Library/Caches` is a default root.
         assert_eq!(inventory.caches.len(), 1);
         assert_eq!(inventory.caches[0].root, bazel);
+    }
+
+    #[test]
+    fn a_walk_finds_every_kind_classify_recognizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env(dir.path());
+        let now = SystemTime::now();
+        output_base(&env.home.join("a/root"), "cccc", Path::new("/x"), now);
+        let install = env
+            .home
+            .join("b/root/install/e15394ac7311f82db7c708c94ae7eeac");
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("build-label.txt"), "9.2.0").unwrap();
+        let disk = disk_cache(&env.home.join("c/disk"), &[]);
+        let repos = env.home.join("d/repos");
+        fs::create_dir_all(repos.join("content_addressable/sha256")).unwrap();
+        let target = env.home.join("e/target");
+        fs::create_dir_all(target.join("debug/.fingerprint")).unwrap();
+        fs::create_dir_all(target.join("debug/deps")).unwrap();
+        fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+        let trash = env.home.join(format!("f/{TRASH_PREFIX}x-1"));
+        fs::create_dir_all(&trash).unwrap();
+
+        let found: BTreeSet<PathBuf> = walk(&env.home, usize::MAX, &env.home)
+            .iter()
+            .map(|item| item.path().to_path_buf())
+            .collect();
+        assert_eq!(
+            found,
+            BTreeSet::from([
+                env.home.join("a/root/cccc"),
+                install,
+                disk,
+                repos,
+                target,
+                trash
+            ])
+        );
     }
 
     #[test]
